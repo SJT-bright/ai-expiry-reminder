@@ -1,0 +1,11 @@
+# 构建产物
+build/
+
+# 本地工具缓存
+.mimosa/
+.v2c/
+.video_agent/
+
+# 系统与日志
+.DS_Store
+*.log
