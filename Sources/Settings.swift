@@ -306,7 +306,7 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
             }
         }
         guard DeleteConfirm.run(item, hint: "手动录入的信息删除后不可恢复，需要重新录入") else { return }
-        Store.shared.deleteManual(id: item.id)
+        Store.shared.deleteManualWithDerived(item.id)
         reloadFromStore()
     }
 

@@ -157,6 +157,13 @@ final class Store {
         manualItems = db.loadItems()
     }
 
+    /// 删除手动条目及其派生的周额度重置窗口（qreset: 前缀）
+    func deleteManualWithDerived(_ id: String) {
+        db.delete(id: id)
+        db.delete(id: "qreset:" + id)
+        manualItems = db.loadItems()
+    }
+
     /// 删除整组（按周划分），返回删除条数
     @discardableResult
     func deleteGroup(_ groupID: String) -> Int {

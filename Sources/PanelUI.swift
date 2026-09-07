@@ -385,12 +385,16 @@ final class EditorSheetController: NSWindowController {
     private let weeklyCheck = NSButton(checkboxWithTitle: "",
                                        target: nil,
                                        action: nil)
+    private let resetCheck = NSButton(checkboxWithTitle: "",
+                                      target: nil,
+                                      action: nil)
+    private let resetPicker = NSDatePicker()
     private weak var formGrid: NSGridView?
 
     init(item: SubItem, isNew: Bool) {
         self.item = item
         self.isNew = isNew
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 430, height: 330),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 430, height: 358),
                            styleMask: [.titled],
                            backing: .buffered, defer: false)
         Glass.glassWindow(win)
@@ -419,6 +423,18 @@ final class EditorSheetController: NSWindowController {
         weeklyCheck.target = self
         weeklyCheck.action = #selector(weeklyChanged)
 
+        // 周额度重置：独立于到期日的 7 天滚动窗口（到期时间 ≠ 额度重置时间）
+        resetCheck.title = "每 7 天重置额度（独立于到期日，自动滚动）"
+        resetCheck.font = NSFont.systemFont(ofSize: 11)
+        resetCheck.target = self
+        resetCheck.action = #selector(resetToggled)
+        resetPicker.datePickerElements = [.yearMonthDay, .hourMinute]
+        resetPicker.datePickerStyle = .textField
+        resetPicker.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        let resetRow = NSStackView(views: [resetCheck, resetPicker])
+        resetRow.orientation = .horizontal
+        resetRow.spacing = 8
+
         // 快捷调整：一键设到期时间
         func quickBtn(_ title: String, _ seconds: TimeInterval) -> NSButton {
             let b = NSButton(title: title, target: self, action: #selector(quickSet(_:)))
@@ -444,8 +460,8 @@ final class EditorSheetController: NSWindowController {
         alertRow.orientation = .horizontal
         alertRow.spacing = 4
 
-        let labels = ["名称", "供应商", "类型", "划分周额度", "到期时间", "快捷调整", "周期(小时)", "提前提醒(分)", "备注"]
-        let fields: [NSView] = [nameField, vendorCombo, kindPopup, weeklyCheck, datePicker, quickRow, repeatField, alertRow, noteField]
+        let labels = ["名称", "供应商", "类型", "周额度重置", "划分周额度", "到期时间", "快捷调整", "周期(小时)", "提前提醒(分)", "备注"]
+        let fields: [NSView] = [nameField, vendorCombo, kindPopup, resetRow, weeklyCheck, datePicker, quickRow, repeatField, alertRow, noteField]
         let rows: [[NSView]] = zip(labels, fields).map { label, field in
             let l = NSTextField(labelWithString: label)
             l.font = .systemFont(ofSize: 11)
@@ -506,17 +522,33 @@ final class EditorSheetController: NSWindowController {
         alertField.stringValue = String(format: "%g", item.alertBeforeMinutes)
         noteField.stringValue = item.note
         weeklyCheck.state = .off
+        // 已有周重置窗口：反推最近一次重置时间（滚动保持相位，减一个周期即为上次重置）
+        if let comp = Store.shared.manualItems.first(where: { $0.id == Self.quotaResetId(for: item.id) }) {
+            resetCheck.state = .on
+            resetPicker.dateValue = comp.expiresAt.addingTimeInterval(-168 * 3600)
+        } else {
+            resetCheck.state = .off
+            resetPicker.dateValue = Date()
+        }
         kindChanged()
     }
 
     @objc private func kindChanged() {
         let isWindow = kindPopup.indexOfSelectedItem == 1
-        // 行号见 buildForm 顺序：3 = 划分周额度，6 = 周期(小时)
-        formGrid?.row(at: 6).isHidden = !isWindow
+        // 行号见 buildForm 顺序：3 = 周额度重置，4 = 划分周额度，7 = 周期(小时)
+        formGrid?.row(at: 7).isHidden = !isWindow
         formGrid?.row(at: 3).isHidden = isWindow
+        formGrid?.row(at: 4).isHidden = isWindow
     }
 
-    @objc private func weeklyChanged() {}
+    @objc private func weeklyChanged() {
+        // 两种周策略互斥：按周划分 = 静态拆分提醒；周额度重置 = 滚动窗口
+        if weeklyCheck.state == .on { resetCheck.state = .off }
+    }
+
+    @objc private func resetToggled() {
+        if resetCheck.state == .on { weeklyCheck.state = .off }
+    }
 
     /// 快捷按钮：可叠加——在当前值基础上累加；若当前值已过去，则从现在起算
     @objc private func quickSet(_ sender: NSButton) {
@@ -558,7 +590,42 @@ final class EditorSheetController: NSWindowController {
         } else {
             onSave?(item)
         }
+        // 周额度重置：到期日只管订阅终止，额度按用户设定的最近重置时间每 7 天独立滚动
+        let resetEnabled = item.kind == .subscription && resetCheck.state == .on && weeklyCheck.state != .on
+        syncQuotaReset(parent: item, enabled: resetEnabled, anchor: resetPicker.dateValue)
         window?.sheetParent?.endSheet(window!)
+    }
+
+    /// 周重置窗口的确定性 id：跟随父订阅，编辑时反查、保存时幂等更新
+    static func quotaResetId(for parentID: String) -> String { "qreset:" + parentID }
+
+    /// 生成 / 更新 / 移除与订阅关联的 7 天额度重置窗口。
+    /// anchor 可以是过去（如 3 天前）也可以是将来（如 3 天后）：写入后由
+    /// rollManualWindows 统一滚动——过去的时间会推进到下一次重置，之后每 7 天一轮。
+    private func syncQuotaReset(parent: SubItem, enabled: Bool, anchor: Date) {
+        let cid = Self.quotaResetId(for: parent.id)
+        guard enabled else {
+            if Store.shared.manualItems.contains(where: { $0.id == cid }) {
+                Store.shared.deleteManual(id: cid)
+            }
+            return
+        }
+        var c: SubItem
+        if let existing = Store.shared.manualItems.first(where: { $0.id == cid }) {
+            c = existing
+        } else {
+            c = SubItem.manualDefault(name: "", vendor: parent.vendor)
+            c.id = cid
+            c.kind = .window
+            c.groupID = parent.groupID ?? parent.id
+            c.note = "「\(parent.name)」每 7 天额度重置，独立于到期日自动滚动"
+        }
+        c.name = parent.name.isEmpty ? "周额度重置" : "\(parent.name)·周重置"
+        c.vendor = parent.vendor
+        c.repeatHours = 168
+        c.expiresAt = anchor
+        c.alertBeforeMinutes = parent.alertBeforeMinutes
+        Store.shared.upsertManual(c)
     }
 }
 
@@ -1057,7 +1124,7 @@ final class PanelController: NSObject {
             }
         }
         guard DeleteConfirm.run(item, hint: "手动录入的信息删除后不可恢复，需要重新录入") else { return }
-        Store.shared.deleteManual(id: item.id)
+        Store.shared.deleteManualWithDerived(item.id)
         rebuildAll()
     }
 
@@ -1100,7 +1167,7 @@ final class PanelController: NSObject {
         editor.onDelete = { [weak self] id in
             guard let it = Store.shared.manualItems.first(where: { $0.id == id }),
                   DeleteConfirm.run(it, hint: "手动录入的信息删除后不可恢复，需要重新录入") else { return false }
-            Store.shared.deleteManual(id: id)
+            Store.shared.deleteManualWithDerived(id)
             deleted()
             self?.activeEditors.removeAll { $0 === editor }
             return true
