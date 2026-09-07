@@ -12,6 +12,14 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 
+# App 图标（缺失时用生成器现场画一个）
+if [ ! -f Assets/AppIcon.icns ]; then
+    echo "==> 生成 App 图标…"
+    swift Assets/make_icon.swift build/AppIcon.iconset >/dev/null
+    iconutil -c icns build/AppIcon.iconset -o Assets/AppIcon.icns
+fi
+cp Assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -23,6 +31,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>1.0</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleExecutable</key><string>AIReminder</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSUIElement</key><true/>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
