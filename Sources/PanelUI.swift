@@ -528,6 +528,8 @@ final class EditorSheetController: NSWindowController {
     private let resetParamField = NSTextField(string: "")
     private let nextPreviewLabel = NSTextField(labelWithString: "")
     private let vendorHintLabel = NSTextField(labelWithString: "")
+    private let purchasePicker = NSDatePicker()
+    private let inferenceLabel = NSTextField(labelWithString: "")
     private let resetPicker = NSDatePicker()
     private weak var formGrid: NSGridView?
     private var lastExpiry: Date?
@@ -587,7 +589,22 @@ final class EditorSheetController: NSWindowController {
         let resetRow2 = NSStackView(views: [resetPicker, resetParamField, nextPreviewLabel])
         resetRow2.orientation = .horizontal
         resetRow2.spacing = 8
-        let resetRow = NSStackView(views: [resetRow1, resetRow2])
+        // 购买时间：推断重置模型的关键输入
+        let purchaseLabel = NSTextField(labelWithString: "购买:")
+        purchaseLabel.font = .systemFont(ofSize: 10)
+        purchaseLabel.textColor = .secondaryLabelColor
+        purchasePicker.datePickerElements = [.yearMonthDay, .hourMinute]
+        purchasePicker.datePickerStyle = .textField
+        purchasePicker.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        purchasePicker.target = self
+        purchasePicker.action = #selector(purchaseChanged)
+        let purchaseRow = NSStackView(views: [purchaseLabel, purchasePicker])
+        purchaseRow.orientation = .horizontal
+        purchaseRow.spacing = 6
+        inferenceLabel.font = .systemFont(ofSize: 9.5)
+        inferenceLabel.textColor = .systemTeal
+        inferenceLabel.maximumNumberOfLines = 2
+        let resetRow = NSStackView(views: [resetRow1, resetRow2, purchaseRow, inferenceLabel])
         resetRow.orientation = .vertical
         resetRow.alignment = .leading
         resetRow.spacing = 4
@@ -715,6 +732,7 @@ final class EditorSheetController: NSWindowController {
         }
         updateResetControls()
         updateVendorHint()
+        purchasePicker.dateValue = item.expiresAt.addingTimeInterval(-28 * 86400)
         kindChanged()
     }
 
@@ -801,6 +819,36 @@ final class EditorSheetController: NSWindowController {
                 datePicker.dateValue.timeIntervalSince(previous))
         }
         lastExpiry = datePicker.dateValue
+        inferFromDates()
+    }
+
+    @objc private func purchaseChanged() {
+        inferFromDates()
+    }
+
+    @objc private func resetDateChanged() {
+        inferFromDates()
+    }
+
+    /// 三时间（购买/到期/最近重置）自动推断重置模型并应用——用户无需手动选模式
+    private func inferFromDates() {
+        guard resetCheck.state == .on else { return }
+        let result = ResetInference.infer(purchase: purchasePicker.dateValue,
+                                          expiry: datePicker.dateValue,
+                                          lastReset: resetPicker.dateValue)
+        switch result.rule {
+        case .calendarMonth: resetModePopup.selectItem(at: 6)
+        case .calendarWeek:  resetModePopup.selectItem(at: 7)
+        case .anchorMonth:   resetModePopup.selectItem(at: 8)
+        case .rolling:
+            let days = max(1, result.param ?? 7)
+            resetModePopup.selectItem(at: Self.rollingDayOptions.firstIndex(of: days) ?? 0)
+        }
+        if result.rule == .calendarMonth || result.rule == .calendarWeek || result.rule == .anchorMonth {
+            resetParamField.stringValue = String(result.param ?? 1)
+        }
+        inferenceLabel.stringValue = "已推断：" + result.explain
+        updateResetControls()
     }
 
     /// 快捷按钮始终沿已填写的时间累加，保留原周期。

@@ -286,3 +286,30 @@ expect(anchor31.nextCalendarReset(after: date("2026-03-15 10:00"), calendar: sha
 // calendarWeek 离线跨多周：不累积，直接下一个周一
 var weekOffline = makeCal("周一离线", rule: .calendarWeek, param: 1, expiry: date("2026-09-14 00:00"))
 expect(weekOffline.nextCalendarReset(after: date("2026-10-20 12:00"), calendar: shanghai) == date("2026-10-26 00:00"), "calendarWeek 离线跨多周不累积")
+
+// ── 重置模型自动推断：购买/到期/最近重置 → 类型判定（降低选择成本） ──
+// 用户例①：9/15 购买、12/14 到期、最近重置 9/17 00:00 → 官方固定每月 17 号（与购买日无关）
+let infer1 = ResetInference.infer(purchase: date("2026-09-15 10:05"),
+                                  expiry: date("2026-12-14 17:29"),
+                                  lastReset: date("2026-09-17 00:00"))
+expect(infer1.rule == .calendarMonth && infer1.param == 17, "推断①：9/17 00:00 → 官方固定每月17号")
+// 订阅日锚定：最近重置的“几号”== 购买日的“几号” → anchorMonth
+let infer2 = ResetInference.infer(purchase: date("2026-09-15 10:05"),
+                                  expiry: date("2026-11-15 10:05"),
+                                  lastReset: date("2026-10-15 00:00"))
+expect(infer2.rule == .anchorMonth && infer2.param == 15, "推断②：重置日=订阅日15号 → anchorMonth")
+// 购买锚定滚动（4 期周额度）：同刻 + 购买/最近重置都在 7 天网格 → rolling
+let infer3 = ResetInference.infer(purchase: date("2026-09-15 10:05"),
+                                  expiry: date("2026-10-13 10:05"),
+                                  lastReset: date("2026-09-29 10:05"))
+expect(infer3.rule == .rolling, "推断③：购买同刻 7 天网格 → 购买锚定滚动")
+// 千问式：最近重置为周一 00:00 且到期日同为周一 → calendarWeek(1=周一)
+let infer4 = ResetInference.infer(purchase: date("2026-09-16 10:05"),
+                                  expiry: date("2026-12-14 10:05"),
+                                  lastReset: date("2026-09-21 00:00"))
+expect(infer4.rule == .calendarWeek && infer4.param == 1, "推断④：周一00:00 → calendarWeek")
+// 保底：杂乱时间 → 按最近重置滚动
+let infer5 = ResetInference.infer(purchase: date("2026-09-16 08:00"),
+                                  expiry: date("2026-12-16 08:00"),
+                                  lastReset: date("2026-09-20 13:00"))
+expect(infer5.rule == .rolling, "推断⑤：杂乱时间保底滚动")

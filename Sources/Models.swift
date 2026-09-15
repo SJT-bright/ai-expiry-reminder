@@ -160,7 +160,76 @@ extension SubItem {
     }
 }
 
-// MARK: - 自动收起抑制器（说明弹窗/编辑期间抑制面板自动收起）
+// MARK: - 重置模型推断（降低选择成本）
+// 输入：购买时间 / 到期时间 / 最近一次重置时间 → 推断「官方固定日历重置」还是「购买锚定滚动」等。
+// 判定依据（公开规则调研见 RESEARCH.md）：
+// - 重置时刻与购买时刻完全同刻、且都在 7 天网格上 → 自购买滚动的周额度
+// - 最近重置的「几号」== 购买日的「几号」→ 订阅日锚定月（anchorMonth）
+// - 最近重置为 00:00 整点 → 官方固定日历（星期几 → calendarWeek；几号 → calendarMonth）
+// - 其余 → 按最近重置时间滚动（保底）
+
+/// 推断结果：规则 + 参数 + 锚点 + 人话解释
+struct ResetInferenceResult: Equatable {
+    let rule: ResetRule
+    let param: Int?
+    let anchor: Date
+    let explain: String
+}
+
+enum ResetInference {
+    static func infer(purchase: Date, expiry: Date, lastReset: Date,
+                      now: Date = Date(), calendar: Calendar = .current) -> ResetInferenceResult {
+        let week: TimeInterval = 7 * 86400
+        let dPE = expiry.timeIntervalSince(purchase)
+        let dPR = lastReset.timeIntervalSince(purchase)
+        let pDay = calendar.component(.day, from: purchase)
+        let rDay = calendar.component(.day, from: lastReset)
+        let pTime = timeOfDaySeconds(purchase, calendar: calendar)
+        let rTime = timeOfDaySeconds(lastReset, calendar: calendar)
+
+        func monthName(_ p: Int) -> String { ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"][min(max(p, 1), 7)] }
+
+        // 1) 完全同刻 + 7 天网格 → 自购买滚动的周额度（如买了 4 期）
+        if dPR >= 0, dPE >= week,
+           abs(dPR.truncatingRemainder(dividingBy: week)) <= 6 * 3600,
+           abs(dPE.truncatingRemainder(dividingBy: week)) <= 6 * 3600, pTime == rTime {
+            let periods = max(1, Int((dPE / week).rounded()))
+            return .init(rule: .rolling, param: 7, anchor: lastReset,
+                         explain: "自购买日(\(Fmt.absTime(purchase)))起每 7 天一期，共约 \(periods) 期周额度；已按最近重置(\(Fmt.absTime(lastReset)))自动滚动")
+        }
+        // 2) 最近重置的「几号」== 购买日的「几号」→ 订阅日锚定月
+        if rDay == pDay {
+            return .init(rule: .anchorMonth, param: pDay, anchor: lastReset,
+                         explain: "每月 \(pDay) 号（订阅日）重置月额度，与到期日无关")
+        }
+        // 3) 最近重置为 00:00 整点 → 官方固定日历（与购买日无关）
+        if rTime == 0 {
+            if calendar.component(.weekday, from: lastReset) == calendar.component(.weekday, from: expiry) || dPE <= 32 * 86400 {
+                let w = weekdayParam(lastReset, calendar: calendar)
+                return .init(rule: .calendarWeek, param: w, anchor: lastReset,
+                             explain: "官方固定每周\(monthName(w)) 00:00 重置周额度（千问式）")
+            }
+            return .init(rule: .calendarMonth, param: rDay, anchor: lastReset,
+                         explain: "官方固定每月 \(rDay) 号重置（与你 \(pDay) 号的购买日无关）")
+        }
+        // 4) 保底：按最近重置时间滚动
+        return .init(rule: .rolling, param: 7, anchor: lastReset,
+                     explain: "未匹配到固定规律，按最近重置(\(Fmt.absTime(lastReset)))每 7 天滚动")
+    }
+
+    private static func timeOfDaySeconds(_ d: Date, calendar: Calendar) -> Int {
+        let c = calendar.dateComponents([.hour, .minute, .second], from: d)
+        return (c.hour ?? 0) * 3600 + (c.minute ?? 0) * 60 + (c.second ?? 0)
+    }
+
+    private static func weekdayParam(_ d: Date, calendar: Calendar) -> Int {
+        // 参数语义：1=周一…7=周日；Calendar.weekday: 1=周日…7=周六
+        let wd = calendar.component(.weekday, from: d)
+        return wd == 1 ? 7 : wd - 1
+    }
+}
+
+/// 自动收起抑制器：说明弹窗/编辑期间抑制面板自动收起
 
 /// 纯逻辑状态机：begin 抑制 → end 按光标位置决定是否立即恢复定时。
 /// 坐标判定由调用方（PanelController，经 NSWindow.convertFromScreen 系统转换）完成。
