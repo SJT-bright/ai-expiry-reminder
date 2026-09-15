@@ -42,10 +42,19 @@ final class Database {
             used_percent REAL,
             group_id TEXT,
             created_at REAL,
-            updated_at REAL
+            updated_at REAL,
+            reset_rule TEXT,
+            reset_param INTEGER
         );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_items_group ON items(group_id);")
+        // v2 迁移：旧库补重置规则列（重复执行时列已存在，exec 会记录一条无害日志）
+        if !columnExists("items", "reset_rule") {
+            exec("ALTER TABLE items ADD COLUMN reset_rule TEXT;")
+        }
+        if !columnExists("items", "reset_param") {
+            exec("ALTER TABLE items ADD COLUMN reset_param INTEGER;")
+        }
         exec("""
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +64,19 @@ final class Database {
             summary TEXT
         );
         """)
+    }
+
+    /// 列是否存在（迁移守卫，避免每次启动的重复 ALTER 日志）
+    private func columnExists(_ table: String, _ column: String) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(stmt) }
+        var found = false
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let name = String(cString: sqlite3_column_text(stmt, 1))
+            if name == column { found = true }
+        }
+        return found
     }
 
     private func exec(_ sql: String) {
@@ -70,13 +92,14 @@ final class Database {
     @discardableResult
     func upsert(_ item: SubItem, action: String) -> Bool {
         let sql = """
-        INSERT INTO items (id,name,vendor,kind,expires_at,repeat_hours,source,note,alert_before,used_percent,group_id,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO items (id,name,vendor,kind,expires_at,repeat_hours,source,note,alert_before,used_percent,group_id,created_at,updated_at,reset_rule,reset_param)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name, vendor=excluded.vendor, kind=excluded.kind,
             expires_at=excluded.expires_at, repeat_hours=excluded.repeat_hours,
             source=excluded.source, note=excluded.note, alert_before=excluded.alert_before,
-            used_percent=excluded.used_percent, group_id=excluded.group_id, updated_at=excluded.updated_at;
+            used_percent=excluded.used_percent, group_id=excluded.group_id, updated_at=excluded.updated_at,
+            reset_rule=excluded.reset_rule, reset_param=excluded.reset_param;
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
@@ -96,6 +119,8 @@ final class Database {
         if let g = item.groupID { sqlite3_bind_text(stmt, 11, (g as NSString).utf8String, -1, nil) } else { sqlite3_bind_null(stmt, 11) }
         sqlite3_bind_double(stmt, 12, created)
         sqlite3_bind_double(stmt, 13, now)
+        if let r = item.resetRule { sqlite3_bind_text(stmt, 14, (r.rawValue as NSString).utf8String, -1, nil) } else { sqlite3_bind_null(stmt, 14) }
+        if let p = item.resetParam { sqlite3_bind_int(stmt, 15, Int32(p)) } else { sqlite3_bind_null(stmt, 15) }
         let ok = sqlite3_step(stmt) == SQLITE_DONE
         if ok { log(action: action, itemId: item.id, summary: item.name) }
         return ok
@@ -132,7 +157,7 @@ final class Database {
         var result: [SubItem] = []
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle,
-            "SELECT id,name,vendor,kind,expires_at,repeat_hours,source,note,alert_before,used_percent,group_id FROM items ORDER BY expires_at;",
+            "SELECT id,name,vendor,kind,expires_at,repeat_hours,source,note,alert_before,used_percent,group_id,reset_rule,reset_param FROM items ORDER BY expires_at;",
             -1, &stmt, nil) == SQLITE_OK else { return result }
         defer { sqlite3_finalize(stmt) }
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -147,11 +172,15 @@ final class Database {
             let alert = sqlite3_column_double(stmt, 8)
             let used: Double? = sqlite3_column_type(stmt, 9) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 9)
             let group: String? = sqlite3_column_type(stmt, 10) == SQLITE_NULL ? nil : String(cString: sqlite3_column_text(stmt, 10))
+            let rule: ResetRule? = sqlite3_column_type(stmt, 11) == SQLITE_NULL
+                ? nil : ResetRule(rawValue: String(cString: sqlite3_column_text(stmt, 11)))
+            let param: Int? = sqlite3_column_type(stmt, 12) == SQLITE_NULL ? nil : Int(sqlite3_column_int(stmt, 12))
             result.append(SubItem(id: id, name: name, vendor: vendor,
                                   kind: kind == "window" ? .window : .subscription,
                                   expiresAt: expires, repeatHours: repeatHours,
                                   source: source, note: note,
-                                  alertBeforeMinutes: alert, usedPercent: used, groupID: group))
+                                  alertBeforeMinutes: alert, usedPercent: used, groupID: group,
+                                  resetRule: rule, resetParam: param))
         }
         return result
     }

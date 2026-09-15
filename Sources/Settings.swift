@@ -1,5 +1,36 @@
 import AppKit
 
+// MARK: - 悬停高亮表格：mouseMoved 跟踪光标所在行，回调给设置窗口做行高亮
+
+final class HoverTableView: NSTableView {
+    var onHoverRow: ((Int?) -> Void)?
+    private var tracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if tracking == nil {
+            let ta = NSTrackingArea(rect: .zero,
+                                    options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+                                    owner: self, userInfo: nil)
+            addTrackingArea(ta)
+            tracking = ta
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) { updateHover(event) }
+    override func mouseMoved(with event: NSEvent) { updateHover(event) }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverRow?(nil)
+    }
+
+    private func updateHover(_ event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let row = row(at: p)
+        onHoverRow?(row >= 0 && row < numberOfRows ? row : nil)
+    }
+}
+
 // MARK: - 设置后台：所有订阅的管理窗口
 // 悬浮窗只负责展示，添加 / 编辑 / 删除 / 通知配置都在这里完成。
 
@@ -12,8 +43,10 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
     private var editBtn: NSButton!
     private var delBtn: NSButton!
     private var refreshBtn: NSButton!
+    private let writeWarnLabel = NSTextField(labelWithString: "")
     private weak var panel: PanelController?
     private var reloadTimer: Timer?
+    private var hoveredRowView: NSTableRowView?
 
     init(panel: PanelController) {
         self.panel = panel
@@ -24,6 +57,26 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
             self?.softReload()
         }
         if let t = reloadTimer { RunLoop.main.add(t, forMode: .common) }
+        // 设置写盘结果（Store 保证主线程回调）；成功清除旧失败提示
+        Store.shared.onSettingsWriteResult = { [weak self] ok in
+            self?.updateWriteWarnLabel(ok: ok)
+        }
+    }
+
+    /// 表格行悬停高亮（当前悬停行背景微亮，移出还原）
+    private func highlightHoverRow(_ row: Int?) {
+        if let old = hoveredRowView { old.backgroundColor = .clear }
+        hoveredRowView = nil
+        guard let row, row >= 0, row < table.numberOfRows else { return }
+        if let rv = table.rowView(atRow: row, makeIfNecessary: false) {
+            rv.backgroundColor = NSColor(white: 1, alpha: 0.05)
+            hoveredRowView = rv
+        }
+    }
+
+    /// 依据最近一次写盘结果更新警示行（主线程）
+    private func updateWriteWarnLabel(ok: Bool) {
+        writeWarnLabel.isHidden = ok
     }
 
     private func buildWindow() {
@@ -34,7 +87,9 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         Glass.glassWindow(window)
 
         // ---- 条目表格（背景透明，透出玻璃材质）----
-        table = NSTableView()
+        let hoverTable = HoverTableView()
+        hoverTable.onHoverRow = { [weak self] row in self?.highlightHoverRow(row) }
+        table = hoverTable
         table.style = .inset
         table.rowHeight = 24
         table.headerView = NSTableHeaderView()
@@ -71,11 +126,11 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         scrollRef = scroll
 
         // ---- 操作按钮 ----
-        let addBtn = NSButton(title: "添加", target: self, action: #selector(addClicked))
-        let editBtn = NSButton(title: "编辑", target: self, action: #selector(editSelected))
-        let delBtn = NSButton(title: "删除", target: self, action: #selector(deleteSelected))
-        let refreshBtn = NSButton(title: "刷新官方", target: self, action: #selector(refreshClicked))
-        let cleanBtn = NSButton(title: "清理过期", target: self, action: #selector(cleanExpired))
+        let addBtn = HoverEffectButton(title: "添加", target: self, action: #selector(addClicked))
+        let editBtn = HoverEffectButton(title: "编辑", target: self, action: #selector(editSelected))
+        let delBtn = HoverEffectButton(title: "删除", target: self, action: #selector(deleteSelected))
+        let refreshBtn = HoverEffectButton(title: "刷新官方", target: self, action: #selector(refreshClicked))
+        let cleanBtn = HoverEffectButton(title: "清理过期", target: self, action: #selector(cleanExpired))
         [addBtn, editBtn, delBtn, refreshBtn, cleanBtn].forEach { $0.bezelStyle = .rounded }
         self.editBtn = editBtn
         self.delBtn = delBtn
@@ -94,7 +149,7 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
 
         webhookField = NSTextField(string: Store.shared.state.feishuWebhook)
         webhookField.placeholderString = "https://open.feishu.cn/open-apis/bot/v2/hook/…"
-        let testBtn = NSButton(title: "测试发送", target: self, action: #selector(testFeishu))
+        let testBtn = HoverEffectButton(title: "测试发送", target: self, action: #selector(testFeishu))
         testBtn.bezelStyle = .rounded
         let notifyRow = NSStackView(views: [webhookField, testBtn])
         notifyRow.orientation = .horizontal
@@ -103,14 +158,20 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         launchCheckbox = NSButton(checkboxWithTitle: "常驻（开机自启+崩溃自动拉起）", target: self, action: #selector(toggleLaunch))
         launchCheckbox.font = .systemFont(ofSize: 10.5)
         launchCheckbox.state = Resident.isInstalled() ? .on : .off
-        let folderBtn = NSButton(title: "打开数据文件夹", target: self, action: #selector(openFolder))
+        let folderBtn = HoverEffectButton(title: "打开数据文件夹", target: self, action: #selector(openFolder))
         folderBtn.bezelStyle = .rounded
         folderBtn.controlSize = .small
         let settingsRow = NSStackView(views: [launchCheckbox, NSView(), folderBtn])
         settingsRow.orientation = .horizontal
         settingsRow.spacing = 8
 
-        let bottom = NSStackView(views: [webhookLabel, notifyRow, settingsRow])
+        // 设置写盘失败警示行（写盘成功后自动清除；仅在主线程更新）
+        writeWarnLabel.stringValue = "⚠ 设置保存失败，更改未写入磁盘"
+        writeWarnLabel.font = .systemFont(ofSize: 10.5)
+        writeWarnLabel.textColor = .systemRed
+        writeWarnLabel.isHidden = true
+
+        let bottom = NSStackView(views: [webhookLabel, notifyRow, settingsRow, writeWarnLabel])
         bottom.orientation = .vertical
         bottom.alignment = .leading
         bottom.spacing = 6
@@ -164,6 +225,11 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
     func showWindow(_ sender: Any?) {
         window.center()
         window.makeKeyAndOrderFront(sender)
+        Motion.reveal(window)
+        // 打开时按最近一次写盘结果同步警示行
+        if let ok = Store.shared.lastSettingsWriteOK {
+            updateWriteWarnLabel(ok: ok)
+        }
     }
 
     var windowRef: NSWindow? { window }
@@ -290,19 +356,20 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
                 allBtn.contentTintColor = .systemRed
                 alert.buttons.last?.keyEquivalent = "\r"
                 NSApp.activate(ignoringOtherApps: true)
-                let choice = alert.runModal()
-                if choice == .alertFirstButtonReturn {
+                // 显式 switch：未知/异常返回值一律视为取消，不落到后续确认框
+                switch alert.runModal() {
+                case .alertFirstButtonReturn:
                     Store.shared.deleteGroup(gid)
                     reloadFromStore()
                     return
-                }
-                if choice == .alertSecondButtonReturn {
+                case .alertSecondButtonReturn:
                     // 组对话框本身就是确认，「仅此条」为显式选择，直接删（与悬浮窗行为一致）
-                    Store.shared.deleteManual(id: item.id)
+                    Store.shared.deleteManualWithDerived(item.id)
                     reloadFromStore()
                     return
+                default:
+                    return
                 }
-                if choice == .alertThirdButtonReturn { return }
             }
         }
         guard DeleteConfirm.run(item, hint: "手动录入的信息删除后不可恢复，需要重新录入") else { return }
@@ -360,7 +427,7 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         go.contentTintColor = .systemRed
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertSecondButtonReturn {
-            Store.shared.deleteManuals(ids: expired.map { $0.id })
+            Store.shared.deleteManualsWithDerived(expired.map { $0.id })
             reloadFromStore()
         }
     }

@@ -41,8 +41,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 echo "==> swiftc 编译中…"
-swiftc -O -swift-version 5 \
-    Sources/Models.swift Sources/Database.swift Sources/Readers.swift Sources/Notifier.swift Sources/PanelUI.swift Sources/Settings.swift Sources/Resident.swift Sources/main.swift \
+swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" -module-cache-path "$BUILD_DIR/module-cache" \
+    Sources/Models.swift Sources/Database.swift Sources/Readers.swift Sources/Notifier.swift Sources/Motion.swift Sources/Vendors.swift Sources/PanelUI.swift Sources/Settings.swift Sources/Resident.swift Sources/main.swift \
     -o "$APP/Contents/MacOS/AIReminder"
 
 codesign --force --deep --sign - "$APP" 2>/dev/null || true

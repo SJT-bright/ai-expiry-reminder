@@ -71,7 +71,9 @@ enum AlertEngine {
         let lines = items.map { item -> String in
             let m = Int(item.expiresAt.timeIntervalSinceNow / 60)
             let when = m >= 1 ? "\(m) 分钟后" : "即将"
-            return "· \(item.vendor) \(item.name) \(when)到期（\(Fmt.absTime(item.expiresAt))）"
+            // 仅真正的额度重置窗口称「重置」；手动通用周期窗口（如续费日）仍称「到期」
+            let verb = item.isQuotaResetWindow ? "重置" : "到期"
+            return "· \(item.vendor) \(item.name) \(when)\(verb)（\(Fmt.absTime(item.expiresAt))）"
         }
         return "⏳ AI到期提醒\n" + lines.joined(separator: "\n")
     }

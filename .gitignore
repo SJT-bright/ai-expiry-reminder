@@ -5,6 +5,7 @@ build/
 .mimosa/
 .v2c/
 .video_agent/
+.zcode/
 
 # 系统与日志
 .DS_Store

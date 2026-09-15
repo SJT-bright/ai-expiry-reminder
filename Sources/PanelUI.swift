@@ -24,15 +24,16 @@ enum DeleteConfirm {
 
 enum Glass {
     static func apply(_ v: NSVisualEffectView, corner: CGFloat) {
-        v.material = .hudWindow
+        v.material = .popover
         v.blendingMode = .behindWindow
         v.state = .active
         v.wantsLayer = true
         v.layer?.cornerRadius = corner
         v.layer?.masksToBounds = true
         v.layer?.borderWidth = 1
-        v.layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
-        v.layer?.backgroundColor = NSColor(white: 0.12, alpha: 0.82).cgColor   // 兜底：材质失效时仍可见
+        v.layer?.borderColor = NSColor(white: 1, alpha: 0.32).cgColor
+        v.layer?.backgroundColor = NSColor(white: 0.10, alpha: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency ? 0.96 : 0.16).cgColor
+        v.layer?.cornerCurve = .continuous
     }
 
     /// 让一个带标题栏的窗口变成半透明玻璃窗
@@ -44,6 +45,69 @@ enum Glass {
         w.backgroundColor = .clear
         w.appearance = NSAppearance(named: .darkAqua)
     }
+}
+
+/// 原生背景模糊上叠加柔和反光；装饰层不截获点击。
+final class FrostedGlassSurface: NSVisualEffectView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let radius = layer?.cornerRadius ?? 16
+        let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.7, dy: 0.7),
+                                 xRadius: radius, yRadius: radius)
+        NSGraphicsContext.saveGraphicsState()
+        shape.addClip()
+        NSGradient(colors: [NSColor(white: 1, alpha: 0.20),
+                            NSColor(white: 1, alpha: 0.015),
+                            NSColor(white: 0, alpha: 0.10)])?.draw(in: bounds, angle: -90)
+        let edge = NSBezierPath(roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5),
+                               xRadius: max(0, radius - 1), yRadius: max(0, radius - 1))
+        NSColor(white: 1, alpha: 0.13).setStroke()
+        edge.lineWidth = 0.6
+        edge.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
+/// macOS 26 使用系统液态玻璃，旧系统保留原生毛玻璃和边缘反光。
+final class GlassSurface: NSView {
+    private let surface: NSView
+    var cornerRadius: CGFloat = 18 {
+        didSet {
+            if #available(macOS 26.0, *), let glass = surface as? NSGlassEffectView {
+                glass.cornerRadius = cornerRadius
+            } else {
+                surface.layer?.cornerRadius = cornerRadius
+                surface.needsDisplay = true
+            }
+        }
+    }
+    override init(frame: NSRect) {
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .clear
+            glass.appearance = NSAppearance(named: .darkAqua)
+            glass.cornerRadius = 18
+            glass.tintColor = NSColor(calibratedRed: 0.10, green: 0.17, blue: 0.22, alpha: 0.35)
+            // 保留外缘折射，内部用薄暗色层稳定浅色壁纸上的文字对比。
+            let backing = NSView()
+            backing.wantsLayer = true
+            backing.layer?.backgroundColor = NSColor(white: 0.025, alpha: 0.48).cgColor
+            glass.contentView = backing
+            surface = glass
+        } else {
+            let glass = FrostedGlassSurface()
+            Glass.apply(glass, corner: 18)
+            surface = glass
+        }
+        super.init(frame: frame)
+        addSubview(surface)
+        surface.autoresizingMask = [.width, .height]
+        surface.frame = bounds
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 // MARK: - 无边框悬浮面板
@@ -118,9 +182,10 @@ final class RowView: NSView {
     private let nameLabel = NSTextField(labelWithString: "")
     private let subLabel = NSTextField(labelWithString: "")
     private let countdownLabel = NSTextField(labelWithString: "")
-    private let deleteBtn = NSButton(title: "✕", target: nil, action: nil)
+    private let deleteBtn = HoverEffectButton(title: "✕", target: nil, action: nil)
     private let barTrack = NSView()
     private let barFill = NSView()
+    private let hoverBg = CALayer()
     private var barFillWidth: NSLayoutConstraint?
     private(set) var item: SubItem?
     var onOpen: ((SubItem) -> Void)?
@@ -132,8 +197,16 @@ final class RowView: NSView {
 
     init() {
         super.init(frame: .zero)
+        wantsLayer = true
+        hoverBg.backgroundColor = NSColor(white: 1, alpha: 0.05).cgColor
+        hoverBg.cornerRadius = 6
+        hoverBg.opacity = 0
+        layer?.addSublayer(hoverBg)
         deleteBtn.target = self
         deleteBtn.action = #selector(deleteTapped)
+        deleteBtn.isBordered = false          // 无边框：干净的字形按钮，不是小方块
+        deleteBtn.font = .systemFont(ofSize: 13, weight: .medium)
+        deleteBtn.contentTintColor = .secondaryLabelColor
         for v in [dot, nameLabel, subLabel, countdownLabel, deleteBtn, barTrack, barFill] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
@@ -174,7 +247,7 @@ final class RowView: NSView {
 
             deleteBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -1),
             deleteBtn.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
-            deleteBtn.widthAnchor.constraint(equalToConstant: 12),
+            deleteBtn.widthAnchor.constraint(equalToConstant: 16),
 
             subLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             subLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -193,8 +266,32 @@ final class RowView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     override func mouseDown(with event: NSEvent) {
+        Motion.press(self, pressed: true)
         guard let item else { return }
         onOpen?(item)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        Motion.press(self, pressed: false)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        Motion.press(self, pressed: false)
+        Motion.float(self, on: false)
+        hoverBg.opacity = 0
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        addTrackingArea(NSTrackingArea(rect: bounds,
+                                       options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    /// 悬停反馈：行浮起（轻微放大）+ 背景高亮；移出落下
+    override func mouseEntered(with event: NSEvent) {
+        Motion.float(self, on: true, scale: 1.04)
+        hoverBg.opacity = 1
     }
 
     @objc private func deleteTapped() {
@@ -248,8 +345,10 @@ final class RowView: NSView {
     }
 
     static func detailTooltip(_ item: SubItem, now: Date) -> String {
+        // 仅额度重置窗口展示「下次重置」；手动通用周期窗口仍是「到期」
+        let verb = item.isQuotaResetWindow ? "下次重置" : "到期"
         var lines = ["\(item.vendor) · \(item.name)",
-                     "到期：\(Fmt.absTime(item.expiresAt))（\(Fmt.countdown(until: item.expiresAt, now: now))）",
+                     "\(verb)：\(Fmt.absTime(item.expiresAt))（\(Fmt.countdown(until: item.expiresAt, now: now))）",
                      "来源：\(item.isAuto ? "官方本地数据" : "手动添加") · 提前\(Int(item.alertBeforeMinutes))分钟提醒"]
         if let used = item.usedPercent {
             var pace = "额度剩余 \(Int(100 - used))%"
@@ -283,9 +382,38 @@ final class InlineEditView: NSView {
     var onDone: (() -> Void)?
 
     private let datePicker = NSDatePicker()
+    private let statusLabel = NSTextField(labelWithString: "")
+    private var statusResetTimer: Timer?
+
+    /// 卡片内的现有界面反馈（如对齐同步失败），不依赖系统通知
+    /// 卡片内的现有界面反馈（不发系统通知/飞书）
+    /// autoHide=false：失败类提示持续显示，直到下一次成功写入（clearStatus）或卡片关闭
+    func showStatus(_ text: String, color: NSColor, autoHide: Bool = true) {
+        statusLabel.stringValue = text
+        statusLabel.textColor = color
+        statusLabel.isHidden = false
+        invalidateIntrinsicContentSize()
+        Motion.fadeIn(statusLabel)
+        statusResetTimer?.invalidate()   // 先取消旧计时器，再按本次语义决定是否隐藏
+        statusResetTimer = nil
+        guard autoHide else { return }
+        statusResetTimer = Timer.scheduledTimer(withTimeInterval: 6, repeats: false) { [weak self] _ in
+            self?.statusLabel.isHidden = true
+            self?.invalidateIntrinsicContentSize()
+        }
+    }
+
+    /// 清除状态行（下一次成功写入时调用，解除失败持续提示）
+    func clearStatus() {
+        statusResetTimer?.invalidate()
+        statusResetTimer = nil
+        guard !statusLabel.isHidden else { return }
+        statusLabel.isHidden = true
+        invalidateIntrinsicContentSize()
+    }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: 92)
+        NSSize(width: NSView.noIntrinsicMetric, height: statusLabel.isHidden ? 92 : 106)
     }
 
     init(item: SubItem) {
@@ -295,7 +423,7 @@ final class InlineEditView: NSView {
         layer?.cornerRadius = 7
 
         func quick(_ title: String, _ seconds: TimeInterval) -> NSButton {
-            let b = NSButton(title: title, target: self, action: #selector(quick(_:)))
+            let b = HoverEffectButton(title: title, target: self, action: #selector(quick(_:)))
             b.bezelStyle = .rounded
             b.controlSize = .small
             b.font = .systemFont(ofSize: 9)
@@ -314,14 +442,14 @@ final class InlineEditView: NSView {
         datePicker.target = self
         datePicker.action = #selector(dateChanged)
 
-        let delBtn = NSButton(title: "删除", target: self, action: #selector(delTapped))
+        let delBtn = HoverEffectButton(title: "删除", target: self, action: #selector(delTapped))
         delBtn.bezelStyle = .rounded
         delBtn.controlSize = .small
         delBtn.contentTintColor = .systemRed
-        let moreBtn = NSButton(title: "更多设置…", target: self, action: #selector(moreTapped))
+        let moreBtn = HoverEffectButton(title: "更多设置…", target: self, action: #selector(moreTapped))
         moreBtn.bezelStyle = .rounded
         moreBtn.controlSize = .small
-        let doneBtn = NSButton(title: "完成", target: self, action: #selector(doneTapped))
+        let doneBtn = HoverEffectButton(title: "完成", target: self, action: #selector(doneTapped))
         doneBtn.bezelStyle = .rounded
         doneBtn.controlSize = .small
         doneBtn.keyEquivalent = "\r"
@@ -330,11 +458,14 @@ final class InlineEditView: NSView {
         actRow.spacing = 6
         actRow.views.first?.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let stack = NSStackView(views: [quickRow, datePicker, actRow])
+        let stack = NSStackView(views: [quickRow, datePicker, actRow, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
-        stack.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = .systemFont(ofSize: 9)
+        statusLabel.textColor = .systemRed
+        statusLabel.isHidden = true
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: topAnchor, constant: 7),
@@ -347,10 +478,7 @@ final class InlineEditView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func quick(_ sender: NSButton) {
-        let current = datePicker.dateValue
-        let now = Date()
-        let base = current > now ? current : now
-        datePicker.dateValue = base.addingTimeInterval(TimeInterval(sender.tag))
+        datePicker.dateValue = datePicker.dateValue.addingTimeInterval(TimeInterval(sender.tag))
         dateChanged()
     }
 
@@ -366,10 +494,18 @@ final class InlineEditView: NSView {
 // MARK: - 添加 / 编辑表单（Sheet，玻璃质感）
 
 final class EditorSheetController: NSWindowController {
-    var onSave: ((SubItem) -> Void)?
-    var onSaveMany: (([SubItem]) -> Void)?
+    /// 返回 false = 写入失败（表单保持打开、输入保留）
+    var onSave: ((SubItem) -> Bool)?
+    var onSaveMany: (([SubItem]) -> Bool)?
     /// 返回 true = 已确认删除（此时表单应关闭）；false = 用户取消（表单保持打开）
     var onDelete: ((String) -> Bool)?
+
+    /// 自测开关：关闭后保存失败不弹系统弹窗（TestRender 断言表单行为时使用）
+    static var showsSaveFailureAlerts = true
+    /// 最近一次保存失败的提示文案（含部分失败）；自测断言用
+    static var lastSaveFailureMessage: String?
+    /// 自测注入点：非 nil 时替代真实的周重置同步（TestRender 验证部分失败边界）
+    var quotaResetSyncOverride: ((SubItem, Bool, Date) -> Bool)?
 
     private var item: SubItem
     private let isNew: Bool
@@ -388,13 +524,18 @@ final class EditorSheetController: NSWindowController {
     private let resetCheck = NSButton(checkboxWithTitle: "",
                                       target: nil,
                                       action: nil)
+    private let resetModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let resetParamField = NSTextField(string: "")
+    private let nextPreviewLabel = NSTextField(labelWithString: "")
+    private let vendorHintLabel = NSTextField(labelWithString: "")
     private let resetPicker = NSDatePicker()
     private weak var formGrid: NSGridView?
+    private var lastExpiry: Date?
 
     init(item: SubItem, isNew: Bool) {
         self.item = item
         self.isNew = isNew
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 430, height: 358),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 430, height: 392),
                            styleMask: [.titled],
                            backing: .buffered, defer: false)
         Glass.glassWindow(win)
@@ -415,6 +556,8 @@ final class EditorSheetController: NSWindowController {
         // 一行式日期时间：分段点击直接键入数字，方向键微调，无需删除键
         datePicker.datePickerElements = [.yearMonthDay, .hourMinute]
         datePicker.datePickerStyle = .textField
+        datePicker.target = self
+        datePicker.action = #selector(expiryChanged)
         repeatField.placeholderString = "周期小时数，例：5"
         alertField.placeholderString = "提前多少分钟提醒"
         noteField.placeholderString = "备注（可选）"
@@ -423,21 +566,44 @@ final class EditorSheetController: NSWindowController {
         weeklyCheck.target = self
         weeklyCheck.action = #selector(weeklyChanged)
 
-        // 周额度重置：独立于到期日的 7 天滚动窗口（到期时间 ≠ 额度重置时间）
-        resetCheck.title = "每 7 天重置额度（独立于到期日，自动滚动）"
+        // 周额度重置：独立于到期日。模式决定模型——滚动(锚点+N小时) / 日历锚定(固定月日·星期) / 订阅日锚定月
+        resetCheck.title = "周期重置 · 独立于到期日"
         resetCheck.font = NSFont.systemFont(ofSize: 11)
         resetCheck.target = self
         resetCheck.action = #selector(resetToggled)
-        resetPicker.datePickerElements = [.yearMonthDay, .hourMinute]
-        resetPicker.datePickerStyle = .textField
-        resetPicker.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        let resetRow = NSStackView(views: [resetCheck, resetPicker])
-        resetRow.orientation = .horizontal
-        resetRow.spacing = 8
+        resetModePopup.addItems(withTitles: ["滚动 7 天", "滚动 30 天（1个月）", "滚动 60 天（2个月）", "滚动 90 天（3个月）", "滚动 180 天", "滚动 365 天", "每月固定日", "每周固定星期", "订阅日锚定月"])
+        resetModePopup.font = .systemFont(ofSize: 10.5)
+        resetModePopup.target = self
+        resetModePopup.action = #selector(resetModeChanged)
+        resetParamField.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        resetParamField.placeholderString = "17"
+        resetParamField.target = self
+        resetParamField.action = #selector(resetParamChanged)
+        nextPreviewLabel.font = .systemFont(ofSize: 9.5)
+        nextPreviewLabel.textColor = .secondaryLabelColor
+        let resetRow1 = NSStackView(views: [resetCheck, resetModePopup])
+        resetRow1.orientation = .horizontal
+        resetRow1.spacing = 8
+        let resetRow2 = NSStackView(views: [resetPicker, resetParamField, nextPreviewLabel])
+        resetRow2.orientation = .horizontal
+        resetRow2.spacing = 8
+        let resetRow = NSStackView(views: [resetRow1, resetRow2])
+        resetRow.orientation = .vertical
+        resetRow.alignment = .leading
+        resetRow.spacing = 4
+
+        // 供应商重置规则提示（调研知识库，来源见 RESEARCH.md）
+        vendorHintLabel.font = .systemFont(ofSize: 9.5)
+        vendorHintLabel.textColor = .tertiaryLabelColor
+        vendorHintLabel.maximumNumberOfLines = 2
+        vendorHintLabel.setAccessibilityIdentifier("vendorHint")
+        vendorCombo.target = self
+        vendorCombo.action = #selector(vendorChanged)
+        updateVendorHint()
 
         // 快捷调整：一键设到期时间
         func quickBtn(_ title: String, _ seconds: TimeInterval) -> NSButton {
-            let b = NSButton(title: title, target: self, action: #selector(quickSet(_:)))
+            let b = HoverEffectButton(title: title, target: self, action: #selector(quickSet(_:)))
             b.bezelStyle = .rounded
             b.controlSize = .small
             b.tag = Int(seconds)
@@ -460,8 +626,8 @@ final class EditorSheetController: NSWindowController {
         alertRow.orientation = .horizontal
         alertRow.spacing = 4
 
-        let labels = ["名称", "供应商", "类型", "周额度重置", "划分周额度", "到期时间", "快捷调整", "周期(小时)", "提前提醒(分)", "备注"]
-        let fields: [NSView] = [nameField, vendorCombo, kindPopup, resetRow, weeklyCheck, datePicker, quickRow, repeatField, alertRow, noteField]
+        let labels = ["名称", "供应商", "厂商规则", "类型", "周额度重置", "划分周额度", "到期时间", "快捷调整", "周期(小时)", "提前提醒(分)", "备注"]
+        let fields: [NSView] = [nameField, vendorCombo, vendorHintLabel, kindPopup, resetRow, weeklyCheck, datePicker, quickRow, repeatField, alertRow, noteField]
         let rows: [[NSView]] = zip(labels, fields).map { label, field in
             let l = NSTextField(labelWithString: label)
             l.font = .systemFont(ofSize: 11)
@@ -475,11 +641,11 @@ final class EditorSheetController: NSWindowController {
         grid.columnSpacing = 8
         grid.translatesAutoresizingMaskIntoConstraints = false
 
-        let deleteBtn = NSButton(title: "删除", target: self, action: #selector(deleteClicked))
+        let deleteBtn = HoverEffectButton(title: "删除", target: self, action: #selector(deleteClicked))
         deleteBtn.contentTintColor = .systemRed
-        let cancelBtn = NSButton(title: "取消", target: self, action: #selector(cancelClicked))
+        let cancelBtn = HoverEffectButton(title: "取消", target: self, action: #selector(cancelClicked))
         cancelBtn.keyEquivalent = "\u{1b}"
-        let saveBtn = NSButton(title: "保存", target: self, action: #selector(saveClicked))
+        let saveBtn = HoverEffectButton(title: "保存", target: self, action: #selector(saveClicked))
         saveBtn.keyEquivalent = "\r"
         let btnSpacer = NSView()
         btnSpacer.setContentHuggingPriority(NSLayoutConstraint.Priority(rawValue: 50), for: .horizontal)
@@ -518,27 +684,104 @@ final class EditorSheetController: NSWindowController {
         vendorCombo.stringValue = item.vendor
         kindPopup.selectItem(at: item.kind == .window ? 1 : 0)
         datePicker.dateValue = item.expiresAt
+        lastExpiry = item.expiresAt
         if let h = item.repeatHours { repeatField.stringValue = String(format: "%g", h) }
         alertField.stringValue = String(format: "%g", item.alertBeforeMinutes)
         noteField.stringValue = item.note
         weeklyCheck.state = .off
-        // 已有周重置窗口：反推最近一次重置时间（滚动保持相位，减一个周期即为上次重置）
+        // 按伴生窗口的规则回填模式；新增默认滚动 7 天（首次重置 = 到期+7天）
         if let comp = Store.shared.manualItems.first(where: { $0.id == Self.quotaResetId(for: item.id) }) {
             resetCheck.state = .on
-            resetPicker.dateValue = comp.expiresAt.addingTimeInterval(-168 * 3600)
+            switch comp.resetRule {
+            case .calendarMonth:
+                resetModePopup.selectItem(at: 6)
+                resetParamField.stringValue = String(comp.resetParam ?? 1)
+            case .calendarWeek:
+                resetModePopup.selectItem(at: 7)
+                resetParamField.stringValue = String(comp.resetParam ?? 1)
+            case .anchorMonth:
+                resetModePopup.selectItem(at: 8)
+                resetParamField.stringValue = String(comp.resetParam ?? 1)
+            case .rolling, nil:
+                // 滚动档位：按 repeatHours 反推天数（7/30/60/90/180/365），未知就近兜底
+                let days = Int((comp.repeatHours ?? 168) / 24)
+                resetModePopup.selectItem(at: Self.rollingDayOptions.firstIndex(of: days) ?? 0)
+                resetPicker.dateValue = comp.expiresAt
+            }
         } else {
             resetCheck.state = .off
-            resetPicker.dateValue = Date()
+            resetModePopup.selectItem(at: 0)
+            resetPicker.dateValue = item.expiresAt.addingTimeInterval(168 * 3600)
         }
+        updateResetControls()
+        updateVendorHint()
         kindChanged()
     }
 
     @objc private func kindChanged() {
         let isWindow = kindPopup.indexOfSelectedItem == 1
-        // 行号见 buildForm 顺序：3 = 周额度重置，4 = 划分周额度，7 = 周期(小时)
-        formGrid?.row(at: 7).isHidden = !isWindow
-        formGrid?.row(at: 3).isHidden = isWindow
+        // 行号见 buildForm 顺序：2 = 厂商提示，4 = 周额度重置，5 = 划分周额度，8 = 周期(小时)
+        formGrid?.row(at: 8).isHidden = !isWindow
         formGrid?.row(at: 4).isHidden = isWindow
+        formGrid?.row(at: 5).isHidden = isWindow
+    }
+
+    @objc private func vendorChanged() {
+        updateVendorHint()
+    }
+
+    /// 供应商 → 调研知识库提示（详见 RESEARCH.md）
+    private func updateVendorHint() {
+        vendorHintLabel.stringValue = VendorResetKnowledge.hint(for: vendorCombo.stringValue) ?? ""
+    }
+
+    @objc private func resetModeChanged() {
+        updateResetControls()
+    }
+
+    @objc private func resetParamChanged() {
+        updateNextPreview()
+    }
+
+    /// 滚动档位（弹窗 index 0-5）对应的天数；index ≥ 档位数 = 日历模型
+    static let rollingDayOptions: [Int] = [7, 30, 60, 90, 180, 365]
+    private var isCalendarMode: Bool { resetModePopup.indexOfSelectedItem >= Self.rollingDayOptions.count }
+
+    /// 按模式切换输入控件：滚动=锚点日期；日历=单个数字参数（月日/星期几）+ 下次重置预览
+    private func updateResetControls() {
+        let mode = resetModePopup.indexOfSelectedItem
+        resetPicker.isHidden = isCalendarMode       // 滚动档位用锚点日期
+        resetParamField.isHidden = !isCalendarMode  // 日历档位用数字参数
+        nextPreviewLabel.isHidden = !isCalendarMode
+        resetParamField.placeholderString = mode == 7 ? "星期几（1=周一…7=周日）" : "几号（1-31）"
+        updateNextPreview()
+    }
+
+    /// 「一个数字」交互：输入 17 = 每月 17 号 00:00 重置；输入 1 = 每周一 00:00 重置
+    private func updateNextPreview() {
+        let mode = resetModePopup.indexOfSelectedItem
+        guard isCalendarMode else {
+            nextPreviewLabel.stringValue = "自下次重置起，每 \(Self.rollingDayOptions[mode]) 天滚动一轮"
+            return
+        }
+        let rule: ResetRule? = mode == 6 ? .calendarMonth : mode == 7 ? .calendarWeek : .anchorMonth
+        let param = sanitizedResetParam(mode: mode)
+        var probe = item
+        probe.resetRule = rule
+        probe.resetParam = param
+        if let next = probe.nextCalendarReset(after: Date()) {
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd 00:00"
+            nextPreviewLabel.stringValue = "下次重置：" + f.string(from: next)
+        } else {
+            nextPreviewLabel.stringValue = "参数无效"
+        }
+    }
+
+    /// 参数清洗：月日 1-31；星期 1-7（1=周一）
+    private func sanitizedResetParam(mode: Int) -> Int {
+        let raw = Int(resetParamField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 1
+        return mode == 2 ? min(max(raw, 1), 7) : min(max(raw, 1), 31)
     }
 
     @objc private func weeklyChanged() {
@@ -550,12 +793,20 @@ final class EditorSheetController: NSWindowController {
         if resetCheck.state == .on { weeklyCheck.state = .off }
     }
 
-    /// 快捷按钮：可叠加——在当前值基础上累加；若当前值已过去，则从现在起算
+    @objc private func expiryChanged() {
+        // 滚动模式（7~365 天）：到期日变化平移重置锚点（与 Store 层 align_reset 一致）；
+        // 日历锚定模式（每月N号/每周X/订阅日锚定）独立于到期日，不平移
+        if resetModePopup.indexOfSelectedItem < Self.rollingDayOptions.count, let previous = lastExpiry {
+            resetPicker.dateValue = resetPicker.dateValue.addingTimeInterval(
+                datePicker.dateValue.timeIntervalSince(previous))
+        }
+        lastExpiry = datePicker.dateValue
+    }
+
+    /// 快捷按钮始终沿已填写的时间累加，保留原周期。
     @objc private func quickSet(_ sender: NSButton) {
-        let current = datePicker.dateValue
-        let now = Date()
-        let base = current > now ? current : now
-        datePicker.dateValue = base.addingTimeInterval(TimeInterval(sender.tag))
+        datePicker.dateValue = datePicker.dateValue.addingTimeInterval(TimeInterval(sender.tag))
+        expiryChanged()
     }
 
     @objc private func stepperChanged() {
@@ -576,6 +827,7 @@ final class EditorSheetController: NSWindowController {
     @objc private func saveClicked() {
         let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
+        expiryChanged()
         item.name = name
         item.vendor = vendorCombo.stringValue.isEmpty ? "未分类" : vendorCombo.stringValue
         item.kind = kindPopup.indexOfSelectedItem == 1 ? .window : .subscription
@@ -585,30 +837,67 @@ final class EditorSheetController: NSWindowController {
         item.note = noteField.stringValue
         item.source = "manual"
 
+        var savedParent: Bool
         if item.kind == .subscription && weeklyCheck.state == .on {
-            onSaveMany?(item.splitWeekly())
+            savedParent = onSaveMany?(item.splitWeekly()) ?? false
         } else {
-            onSave?(item)
+            savedParent = onSave?(item) ?? false
         }
-        // 周额度重置：到期日只管订阅终止，额度按用户设定的最近重置时间每 7 天独立滚动
+        Self.lastSaveFailureMessage = nil
+        guard savedParent else {
+            // 写入失败：表单保持打开、输入原样保留，用户可直接重试
+            Self.lastSaveFailureMessage = "保存失败"
+            if Self.showsSaveFailureAlerts {
+                let alert = NSAlert()
+                alert.messageText = "保存失败"
+                alert.informativeText = "数据未能写入，表单内容已保留，请重试。"
+                alert.runModal()
+            }
+            return
+        }
+        // 周额度重置：到期日只管订阅终止；重置节奏由模式决定（滚动 7~365 天 / 日历锚定）
+        let mode = resetModePopup.indexOfSelectedItem
+        let rule: ResetRule? = mode < Self.rollingDayOptions.count
+            ? .rolling
+            : mode == 6 ? .calendarMonth : mode == 7 ? .calendarWeek : .anchorMonth
+        let param: Int? = mode < Self.rollingDayOptions.count ? Self.rollingDayOptions[mode] : sanitizedResetParam(mode: mode)
         let resetEnabled = item.kind == .subscription && resetCheck.state == .on && weeklyCheck.state != .on
-        syncQuotaReset(parent: item, enabled: resetEnabled, anchor: resetPicker.dateValue)
+        let hadCompanion = Store.shared.manualItems.contains { $0.id == Self.quotaResetId(for: item.id) }
+        let resetSaved = quotaResetSyncOverride?(item, resetEnabled, resetPicker.dateValue)
+            ?? syncQuotaReset(parent: item, enabled: resetEnabled, rule: rule, param: param, anchor: resetPicker.dateValue)
         window?.sheetParent?.endSheet(window!)
+        if !resetSaved {
+            // 部分失败边界：主条目已保存成功，仅派生窗口未同步；按伴生是否存在给出准确指引
+            Self.lastSaveFailureMessage =
+                resetEnabled
+                    ? (hadCompanion
+                       ? "订阅已保存，但周额度重置时间未能更新（保持原值）。请重新打开该条目并再次保存以重试。"
+                       : "订阅已保存，但周额度重置未能启用：请重新打开该条目、勾选周期重置并保存。")
+                    : "订阅已保存，但旧的周额度重置窗口移除失败"
+        }
+        // 汇总部分失败（闭包内对齐失败 / 派生窗口同步失败）并统一反馈
+        if let msg = Self.lastSaveFailureMessage, Self.showsSaveFailureAlerts {
+            let alert = NSAlert()
+            alert.messageText = "部分保存失败"
+            alert.informativeText = msg
+            alert.runModal()
+        }
     }
 
     /// 周重置窗口的确定性 id：跟随父订阅，编辑时反查、保存时幂等更新
     static func quotaResetId(for parentID: String) -> String { "qreset:" + parentID }
 
-    /// 生成 / 更新 / 移除与订阅关联的 7 天额度重置窗口。
-    /// anchor 可以是过去（如 3 天前）也可以是将来（如 3 天后）：写入后由
-    /// rollManualWindows 统一滚动——过去的时间会推进到下一次重置，之后每 7 天一轮。
-    private func syncQuotaReset(parent: SubItem, enabled: Bool, anchor: Date) {
+    /// 生成 / 更新 / 移除与订阅关联的周期重置窗口。返回写入是否成功。
+    /// rolling：anchor 为下次重置时间（由 rollManualWindows 按 repeatHours 滚动）；
+    /// 日历模型：resetRule/resetParam 决定节点，expiresAt = 下一个未来节点（离线不累积）。
+    @discardableResult
+    private func syncQuotaReset(parent: SubItem, enabled: Bool, rule: ResetRule?, param: Int?, anchor: Date) -> Bool {
         let cid = Self.quotaResetId(for: parent.id)
         guard enabled else {
             if Store.shared.manualItems.contains(where: { $0.id == cid }) {
-                Store.shared.deleteManual(id: cid)
+                return Store.shared.deleteManual(id: cid)
             }
-            return
+            return true
         }
         var c: SubItem
         if let existing = Store.shared.manualItems.first(where: { $0.id == cid }) {
@@ -618,14 +907,35 @@ final class EditorSheetController: NSWindowController {
             c.id = cid
             c.kind = .window
             c.groupID = parent.groupID ?? parent.id
-            c.note = "「\(parent.name)」每 7 天额度重置，独立于到期日自动滚动"
         }
-        c.name = parent.name.isEmpty ? "周额度重置" : "\(parent.name)·周重置"
+        let calendar = rule == .calendarMonth || rule == .calendarWeek || rule == .anchorMonth
+        c.name = parent.name.isEmpty ? "周期重置" : "\(parent.name)·周期重置"
         c.vendor = parent.vendor
-        c.repeatHours = 168
-        c.expiresAt = anchor
         c.alertBeforeMinutes = parent.alertBeforeMinutes
-        Store.shared.upsertManual(c)
+        if calendar, let rule, let param {
+            c.resetRule = rule
+            c.resetParam = param
+            c.repeatHours = nil
+            c.expiresAt = c.nextCalendarReset(after: Date()) ?? anchor
+            switch rule {
+            case .calendarMonth:
+                c.note = "「\(parent.name)」每月 \(param) 日 00:00 重置额度，独立于到期日"
+            case .calendarWeek:
+                let names = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+                c.note = "「\(parent.name)」每周 \(names[param]) 00:00 重置额度，独立于到期日"
+            default:
+                c.note = "「\(parent.name)」每月订阅日 00:00 重置额度（订阅日锚定月）"
+            }
+        } else {
+            // 滚动档位：param 即天数（7/30/60/90/180/365），写入 repeatHours 供 rollManualWindows 滚动
+            let days = (rule == .rolling ? param : nil) ?? 7
+            c.resetRule = .rolling
+            c.resetParam = days
+            c.repeatHours = Double(days * 24)
+            c.expiresAt = anchor
+            c.note = "「\(parent.name)」每 \(days) 天额度重置，独立于到期日自动滚动"
+        }
+        return Store.shared.upsertManual(c).saved
     }
 }
 
@@ -648,7 +958,7 @@ final class PanelController: NSObject {
     }
 
     private let panel: FloatingPanel
-    private let effect = NSVisualEffectView()
+    private let effect = GlassSurface()
     private let titleLabel = NSTextField(labelWithString: "⏳")
     private let rowsContainer = NSView()
     private let pillLabel = NSTextField(labelWithString: "")
@@ -656,6 +966,7 @@ final class PanelController: NSObject {
 
     private var currentIds: [String] = []
     private var editingId: String?
+    private weak var activeInlineView: InlineEditView?
     private var autoItems: [SubItem] = []
     private var refreshing = false
     private var tickCount = 0
@@ -663,9 +974,10 @@ final class PanelController: NSObject {
     private var settings: SettingsWindowController?
     private var activeEditors: [EditorSheetController] = []
     private var collapseTimer: Timer?
+    private var collapseSuppressor = AutoCollapseSuppressor()
     private var container: PanelContainerView!
 
-    override init() {
+    init(loadOfficialData: Bool = true) {
         panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: Metrics.pillWidth, height: Metrics.pillHeight),
                               styleMask: [.borderless, .nonactivatingPanel],
                               backing: .buffered, defer: false)
@@ -674,7 +986,7 @@ final class PanelController: NSObject {
         buildUI()
         buildStatusItem()
         rebuildAll()
-        refreshData()
+        if loadOfficialData { refreshData() }
     }
 
     // MARK: 面板与位置
@@ -711,12 +1023,12 @@ final class PanelController: NSObject {
     }
 
     private func buildUI() {
-        Glass.apply(effect, corner: 10)
+        effect.cornerRadius = 18
 
         titleLabel.font = .systemFont(ofSize: 10)
 
         func miniBtn(_ title: String, _ action: Selector) -> NSButton {
-            let b = NSButton(title: title, target: self, action: action)
+            let b = HoverEffectButton(title: title, target: self, action: action)
             b.isBordered = false
             b.font = .systemFont(ofSize: 11)
             b.contentTintColor = .secondaryLabelColor
@@ -745,8 +1057,17 @@ final class PanelController: NSObject {
         container.addSubview(pillLabel)
         panel.contentView = container
 
-        container.onMouseEnter = { [weak self] in self?.cancelAutoCollapse() }
-        container.onMouseExit = { [weak self] in self?.scheduleAutoCollapse() }
+        container.onMouseEnter = { [weak self] in
+            guard let self else { return }
+            self.cancelAutoCollapse()
+            // 收起态：悬停药丸浮起
+            if Store.shared.state.panelCollapsed { Motion.float(self.pillLabel, on: true, scale: 1.1) }
+        }
+        container.onMouseExit = { [weak self] in
+            guard let self else { return }
+            self.scheduleAutoCollapse()
+            if Store.shared.state.panelCollapsed { Motion.float(self.pillLabel, on: false) }
+        }
         container.onBackgroundClick = { [weak self] in self?.pillClicked() }
 
         effect.menu = buildContextMenu()
@@ -769,7 +1090,8 @@ final class PanelController: NSObject {
         guard let b = panel.contentView?.bounds else { return }
         let collapsed = Store.shared.state.panelCollapsed
         effect.frame = b
-        effect.layer?.cornerRadius = collapsed ? 9 : 12
+        effect.cornerRadius = collapsed ? 9 : 18
+        effect.needsDisplay = true
 
         if collapsed {
             headerView.isHidden = true
@@ -792,10 +1114,17 @@ final class PanelController: NSObject {
             let w = b.width - Metrics.padSide * 2
             rowsContainer.frame = NSRect(x: Metrics.padSide, y: Metrics.padBottom,
                                          width: w, height: max(rowsTop - Metrics.padBottom, 0))
-            // 逐条摆放（自上而下）：分区标题 14 / 行 24，间距 1
+            // 逐条摆放（自上而下）：分区标题 14 / 行 24 / 内联编辑卡用固有高度，间距 1
             var y = rowsContainer.bounds.height
             for v in rowsContainer.subviews {
-                let h: CGFloat = (v is SectionHeaderView) ? Metrics.sectionH : Metrics.rowH
+                let h: CGFloat
+                if v is SectionHeaderView {
+                    h = Metrics.sectionH
+                } else if let inline = v as? InlineEditView {
+                    h = inline.intrinsicContentSize.height
+                } else {
+                    h = Metrics.rowH
+                }
                 y -= h
                 v.frame = NSRect(x: 0, y: y, width: w, height: h)
                 y -= Metrics.spacing
@@ -816,6 +1145,7 @@ final class PanelController: NSObject {
         Store.shared.state.panelCollapsed = collapsed
         Store.shared.save()
         rebuildAll()
+        if !collapsed { Motion.reveal(rowsContainer) }   // 展开时内容虚化渐入
     }
 
     func pillClicked() {
@@ -830,6 +1160,7 @@ final class PanelController: NSObject {
 
     private func scheduleAutoCollapse() {
         cancelAutoCollapse()
+        guard collapseSuppressor.shouldSchedule else { return }   // 说明弹窗/编辑期间抑制
         guard !Store.shared.state.panelCollapsed else { return }
         collapseTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
             self?.applyCollapsed(true)
@@ -927,8 +1258,17 @@ final class PanelController: NSObject {
             let nearest = items[0]
             let text = Fmt.countdownShort(until: nearest.expiresAt, now: now)
             if text != pillLabel.stringValue {
-                pillLabel.stringValue = text
-                pillLabel.textColor = RowView.urgencyColor(nearest, now: now)
+                let color = RowView.urgencyColor(nearest, now: now)
+                if nearest.expiresAt.timeIntervalSince(now) < 120 {
+                    // 最后两分钟文本每秒变化，直接更新避免持续闪烁
+                    pillLabel.stringValue = text
+                    pillLabel.textColor = color
+                } else {
+                    Motion.crossfadeText(pillLabel) {
+                        self.pillLabel.stringValue = text
+                        self.pillLabel.textColor = color
+                    }
+                }
             }
         }
         rebuildIfNeeded(items: items)
@@ -944,6 +1284,7 @@ final class PanelController: NSObject {
                 UserDefaults.standard.removeObject(forKey: "panelOrigin")   // 丢弃离屏的旧坐标
             }
             panel.makeKeyAndOrderFront(nil)
+            Motion.reveal(panel)
         }
         if tickCount % 10 == 0 { checkAlerts(items: items, now: now) }
     }
@@ -957,12 +1298,13 @@ final class PanelController: NSObject {
     private func makeInlineEditor(_ item: SubItem) -> NSView? {
         guard !item.isAuto else { return nil }
         let editor = InlineEditView(item: item)
+        activeInlineView = editor
         editor.onChange = { [weak self] date in self?.inlineChange(id: item.id, date: date) }
         editor.onDelete = { [weak self] in self?.inlineDelete(id: item.id) }
         editor.onEditMore = { [weak self] in self?.inlineEditMore(id: item.id) }
         editor.onDone = { [weak self] in
             self?.editingId = nil
-            self?.rebuildAll()
+            self?.rebuildAll(animate: true)
         }
         return editor
     }
@@ -979,9 +1321,12 @@ final class PanelController: NSObject {
                 let row = RowView()
                 row.configure(item, now: Date())
                 row.onOpen = { [weak self] in self?.openItem($0) }
-                row.configure(item, now: Date())
                 row.onDelete = { [weak self] in self?.deleteItem($0) }
                 entries.append((row, Metrics.rowH))
+                // 点击条目展开内联编辑卡（README 承诺的行下编辑入口）
+                if editingId == item.id, let editor = makeInlineEditor(item) {
+                    entries.append((editor, editor.intrinsicContentSize.height))
+                }
             }
         }
 
@@ -998,17 +1343,38 @@ final class PanelController: NSObject {
         return entries
     }
 
-    private func rebuildAll() {
+    /// 重建面板内容。animate=true 时内联编辑卡波浪展开/收起、其余行平滑让位
+    /// （用户主动操作传入 true；每秒数据刷新走默认 false，保持同步、不动画）
+    private func rebuildAll(animate: Bool = false) {
         let entries = buildEntries()
         currentIds = entries.compactMap { ($0.view as? RowView)?.item?.id }
         rowsContainer.subviews.forEach { $0.removeFromSuperview() }
-        for (view, _) in entries {
+        var revealInline = false
+        for (view, height) in entries {
+            if animate, view is InlineEditView {
+                view.wantsLayer = true
+                view.alphaValue = 0
+                revealInline = true
+            }
             rowsContainer.addSubview(view)
         }
         let contentH = Metrics.padTop + Metrics.headerH + 3
             + entries.reduce(0) { $0 + $1.height + Metrics.spacing }
             + Metrics.padBottom
-        updateFrame(expanded: !Store.shared.state.panelCollapsed, contentH: contentH)
+
+        // 高度/行位变化统一在此生效：animate 时走隐式动画（卡片波浪展开、下方行平滑让位）
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = Motion.revealDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ctx.allowsImplicitAnimation = animate
+            self.updateFrame(expanded: !Store.shared.state.panelCollapsed, contentH: contentH)
+            if revealInline {
+                for case let v as InlineEditView in self.rowsContainer.subviews {
+                    v.alphaValue = 1
+                }
+            }
+        }, completionHandler: nil)
+
         if Store.shared.state.panelCollapsed {
             pillLabel.stringValue = pillText()
         }
@@ -1044,25 +1410,59 @@ final class PanelController: NSObject {
 
     /// 点击条目：手动条目 → 行下展开内联编辑卡；官方条目 → 说明
     private func openItem(_ item: SubItem) {
+        cancelAutoCollapse()   // 说明/编辑期间不自动收起（模态运行在 .common 模式下计时器仍会触发）
         guard !item.isAuto else {
+            // 模态会吞掉 mouseUp：先恢复按压态，避免行卡在半透明
+            for case let row as RowView in rowsContainer.subviews {
+                Motion.press(row, pressed: false)
+            }
+            // 模态期间 mouseExited 仍会重挂收起定时器 → 用抑制器拦住；结束后按光标位置恢复
+            collapseSuppressor.begin()
             let alert = NSAlert()
             alert.messageText = item.name
             alert.informativeText = "来源：\(item.source) 官方本地数据\n到期：\(Fmt.absTime(item.expiresAt))\n\(item.note)\n（官方数据每次刷新自动更新，如需自定义请手动添加）"
             alert.runModal()
+            if collapseSuppressor.end(cursorInsidePanel: isCursorInsidePanel()) {
+                scheduleAutoCollapse()
+            }
             return
         }
-        cancelAutoCollapse()
         editingId = (editingId == item.id) ? nil : item.id   // 再点一次收起
-        rebuildAll()
+        rebuildAll(animate: true)
+    }
+
+    /// 光标（屏幕坐标）是否位于面板**整个内容区**（含 header 工具条与内边距，
+    /// 与 PanelContainerView 追踪区范围一致）。仅用 rect 版系统转换，避免点/矩形重载歧义
+    private func isCursorInsidePanel() -> Bool {
+        guard let content = panel.contentView, let win = content.window else { return false }
+        let boundsInWindow = content.convert(content.bounds, to: nil)
+        let inScreen = win.convertToScreen(boundsInWindow)
+        return inScreen.contains(NSEvent.mouseLocation)
     }
 
     /// 内联编辑卡回调
     private func inlineChange(id: String, date: Date) {
         guard var it = Store.shared.manualItems.first(where: { $0.id == id }) else { return }
+        let persisted = it                       // 已持久化的旧值：写失败时行显示回退到此，避免假数据
         it.expiresAt = date
-        Store.shared.upsertManual(it)
+        let result = Store.shared.upsertManual(it)
+        let displayItem = result.saved ? it : persisted
         for case let row as RowView in rowsContainer.subviews where row.item?.id == id {
-            row.updateItem(it)
+            row.updateItem(displayItem)
+        }
+        // 卡片内现有界面反馈（不发系统通知/飞书）；对齐失败证据留存 Store.lastAlignmentFailures
+        switch result {
+        case .savedWithAlignFailure(let failures):
+            // 失败提示持续显示（autoHide=false），直到下一次成功写入或卡片关闭
+            activeInlineView?.showStatus("已保存，但 \(failures.count) 项关联同步失败", color: .systemRed, autoHide: false)
+            NSLog("AR: 内联保存对齐失败 \(failures.joined(separator: ","))")
+        case .parentFailed:
+            activeInlineView?.showStatus("保存失败，请重试", color: .systemRed, autoHide: false)
+            NSLog("AR: 内联保存写入失败")
+        case .success:
+            activeInlineView?.clearStatus()   // 成功写入清除失败提示
+        default:
+            break
         }
     }
 
@@ -1093,7 +1493,7 @@ final class PanelController: NSObject {
             if let idx = autoItems.firstIndex(where: { $0.id == item.id }) {
                 autoItems.remove(at: idx)
             }
-            rebuildAll()
+            rebuildAll(animate: true)
             Notifier.post(title: "已隐藏：\(item.name)",
                           body: "官方数据本地仍会更新，点 ⟳ 刷新官方数据即可恢复显示")
             return
@@ -1115,17 +1515,17 @@ final class PanelController: NSObject {
                 case .alertFirstButtonReturn:
                     Store.shared.deleteGroup(gid)
                 case .alertSecondButtonReturn:
-                    Store.shared.deleteManual(id: item.id)
+                    Store.shared.deleteManualWithDerived(item.id)
                 default:
                     return
                 }
-                rebuildAll()
+                rebuildAll(animate: true)
                 return
             }
         }
         guard DeleteConfirm.run(item, hint: "手动录入的信息删除后不可恢复，需要重新录入") else { return }
         Store.shared.deleteManualWithDerived(item.id)
-        rebuildAll()
+        rebuildAll(animate: true)
     }
 
     private func Store_dismissedAuto() -> [String] {
@@ -1155,14 +1555,29 @@ final class PanelController: NSObject {
         editor.window?.isReleasedWhenClosed = false
         activeEditors.append(editor)   // 保活：否则控制器释放后按钮 target 变 nil
         editor.onSave = { [weak self] savedItem in
-            Store.shared.upsertManual(savedItem)
-            saved()
-            self?.activeEditors.removeAll { $0 === editor }
+            let result = Store.shared.upsertManual(savedItem)
+            if result.saved {
+                saved()
+                self?.activeEditors.removeAll { $0 === editor }
+            }
+            if case .savedWithAlignFailure(let failures) = result {
+                // 明确哪些关联未同步；证据留存于 Store.lastAlignmentFailures，恢复方案另行处理
+                EditorSheetController.lastSaveFailureMessage =
+                    "订阅已保存，但以下关联未能同步：\(failures.joined(separator: "、"))"
+            }
+            return result.saved
         }
         editor.onSaveMany = { [weak self] savedItems in
-            savedItems.forEach { Store.shared.upsertManual($0) }
-            saved()
-            self?.activeEditors.removeAll { $0 === editor }
+            let result = Store.shared.upsertManual(savedItems)
+            if result.saved {
+                saved()
+                self?.activeEditors.removeAll { $0 === editor }
+            }
+            if case .partialSaved(let written, let failed) = result {
+                EditorSheetController.lastSaveFailureMessage =
+                    "按周划分部分成员已保存（成功 \(written) 条，失败 \(failed) 条）。失败的成员未写入，请再次保存以补齐。"
+            }
+            return result.saved
         }
         editor.onDelete = { [weak self] id in
             guard let it = Store.shared.manualItems.first(where: { $0.id == id }),
@@ -1222,6 +1637,7 @@ final class PanelController: NSObject {
     func showPanel() {
         applyCollapsed(Store.shared.state.panelCollapsed)
         panel.makeKeyAndOrderFront(nil)
+        Motion.reveal(panel)
     }
 
     // MARK: 自测渲染支持
