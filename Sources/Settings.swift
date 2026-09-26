@@ -32,13 +32,12 @@ final class HoverTableView: NSTableView {
 }
 
 // MARK: - 设置后台：所有订阅的管理窗口
-// 悬浮窗只负责展示，添加 / 编辑 / 删除 / 通知配置都在这里完成。
+// 悬浮窗只负责展示，添加 / 编辑 / 删除都在这里完成。
 
 final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var window: NSWindow!
     private var table: NSTableView!
     private var items: [SubItem] = []
-    private var webhookField: NSTextField!
     private var launchCheckbox: NSButton!
     private var editBtn: NSButton!
     private var delBtn: NSButton!
@@ -80,7 +79,7 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
     }
 
     private func buildWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 430),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 384),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -143,18 +142,6 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         btnCol.translatesAutoresizingMaskIntoConstraints = false
 
         // ---- 底部设置区（垂直堆叠，天然不会互相重叠）----
-        let webhookLabel = NSTextField(labelWithString: "飞书群机器人 Webhook（可选，到期前自动推送）")
-        webhookLabel.font = .systemFont(ofSize: 10.5)
-        webhookLabel.textColor = .secondaryLabelColor
-
-        webhookField = NSTextField(string: Store.shared.state.feishuWebhook)
-        webhookField.placeholderString = "https://open.feishu.cn/open-apis/bot/v2/hook/…"
-        let testBtn = HoverEffectButton(title: "测试发送", target: self, action: #selector(testFeishu))
-        testBtn.bezelStyle = .rounded
-        let notifyRow = NSStackView(views: [webhookField, testBtn])
-        notifyRow.orientation = .horizontal
-        notifyRow.spacing = 8
-
         launchCheckbox = NSButton(checkboxWithTitle: "常驻（开机自启+崩溃自动拉起）", target: self, action: #selector(toggleLaunch))
         launchCheckbox.font = .systemFont(ofSize: 10.5)
         launchCheckbox.state = Resident.isInstalled() ? .on : .off
@@ -171,7 +158,7 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         writeWarnLabel.textColor = .systemRed
         writeWarnLabel.isHidden = true
 
-        let bottom = NSStackView(views: [webhookLabel, notifyRow, settingsRow, writeWarnLabel])
+        let bottom = NSStackView(views: [settingsRow, writeWarnLabel])
         bottom.orientation = .vertical
         bottom.alignment = .leading
         bottom.spacing = 6
@@ -216,9 +203,7 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
             bottom.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -12),
             bottom.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10),
 
-            notifyRow.widthAnchor.constraint(lessThanOrEqualTo: bottom.widthAnchor),
             settingsRow.widthAnchor.constraint(equalTo: bottom.widthAnchor),
-            webhookField.widthAnchor.constraint(equalToConstant: 380),
         ])
     }
 
@@ -391,12 +376,6 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
                 self?.refreshBtn.isEnabled = true
             }
         }
-    }
-
-    @objc private func testFeishu() {
-        Store.shared.state.feishuWebhook = webhookField.stringValue
-        Store.shared.save()
-        Feishu.send(webhook: webhookField.stringValue, text: "✅ AI到期提醒：飞书推送配置成功")
     }
 
     @objc private func toggleLaunch() {

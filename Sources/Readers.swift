@@ -76,7 +76,6 @@ final class CodexReader: SourceReader {
                                      repeatHours: nil,
                                      source: "codex",
                                      note: "来源：官方 auth.json（JWT 订阅声明）",
-                                     alertBeforeMinutes: 60 * 24,
                                      groupID: nil))
             }
         }
@@ -96,7 +95,6 @@ final class CodexReader: SourceReader {
                                          repeatHours: Double(w.windowMinutes) / 60.0,
                                          source: "codex",
                                          note: String(format: "官方 rate_limits · 剩余 %.0f%%", 100 - w.usedPercent),
-                                         alertBeforeMinutes: 15,
                                          usedPercent: w.usedPercent,
                                          groupID: nil))
                 }
@@ -251,8 +249,7 @@ final class ClaudeReader: SourceReader {
                            expiresAt: reset,
                            repeatHours: 5,
                            source: "claude",
-                           note: "根据本地会话时间估算",
-                           alertBeforeMinutes: 15)
+                           note: "根据本地会话时间估算")
         return ReaderResult(items: [item], status: "已估算当前窗口")
     }
 

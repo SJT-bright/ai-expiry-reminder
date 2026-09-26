@@ -6,7 +6,8 @@ import CoreImage
 // 鼠标移入：轻微放大浮起 + 高亮；移出：落下还原。全局统一交互语言。
 
 class HoverEffectButton: NSButton {
-    var hoverScale: CGFloat = 1.06
+    /// 悬停放大档：1.12 + 更亮的高亮层——「触感更强」的手感基准，全局按钮统一
+    var hoverScale: CGFloat = 1.12
     private var tracking: NSTrackingArea?
 
     override func updateTrackingAreas() {
@@ -21,8 +22,8 @@ class HoverEffectButton: NSButton {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        Motion.float(self, on: true, scale: hoverScale)
-        Motion.highlight(self, on: true, color: NSColor(white: 1, alpha: 0.08))
+        Motion.float(self, on: true, scale: hoverScale, lift: 1.0)
+        Motion.highlight(self, on: true, color: NSColor(white: 1, alpha: 0.14))
     }
 
     override func mouseExited(with event: NSEvent) {

@@ -15,7 +15,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Resident.install()
         }
 
-        Notifier.requestPermission()
         panelController = PanelController()
         panelController?.showPanel()
 

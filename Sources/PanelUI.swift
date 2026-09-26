@@ -110,6 +110,18 @@ final class GlassSurface: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+/// 小胶囊悬停只提亮轮廓，不缩放或移动文字，不改变玻璃透明度。
+final class PillHoverOutline: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 0.8, dy: 0.8)
+        let outline = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
+        NSColor(white: 1, alpha: 0.26).setStroke()
+        outline.lineWidth = 0.65
+        outline.stroke()
+    }
+}
+
 // MARK: - 无边框悬浮面板
 
 final class FloatingPanel: NSPanel {
@@ -239,11 +251,13 @@ final class RowView: NSView {
             dot.heightAnchor.constraint(equalToConstant: 5),
 
             nameLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
-            nameLabel.centerYAnchor.constraint(equalTo: topAnchor, constant: 7),
+            // 双行文本块垂直重心：上空 2.5 ≈ 副标题与进度条之间空 2，避免文字头贴顶
+            nameLabel.topAnchor.constraint(equalTo: topAnchor, constant: 2.5),
             nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: countdownLabel.leadingAnchor, constant: -8),
 
+            // 倒计时与名称字体不同（等宽半粗 vs 系统），按基线对齐才不会出现半像素高低差
+            countdownLabel.lastBaselineAnchor.constraint(equalTo: nameLabel.lastBaselineAnchor),
             countdownLabel.trailingAnchor.constraint(equalTo: deleteBtn.leadingAnchor, constant: -4),
-            countdownLabel.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
 
             deleteBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -1),
             deleteBtn.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
@@ -251,7 +265,7 @@ final class RowView: NSView {
 
             subLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             subLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
-            subLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor),
+            subLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 0.5),
 
             barTrack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 1),
             barTrack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -1),
@@ -264,6 +278,15 @@ final class RowView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        // 手动托管子层不会随视图自动布局，必须在每次布局时同步尺寸，否则高亮恒为 0×0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        hoverBg.frame = bounds
+        CATransaction.commit()
+    }
 
     override func mouseDown(with event: NSEvent) {
         Motion.press(self, pressed: true)
@@ -288,9 +311,10 @@ final class RowView: NSView {
                                        owner: self, userInfo: nil))
     }
 
-    /// 悬停反馈：行浮起（轻微放大）+ 背景高亮；移出落下
+    /// 悬停反馈：整行垂直浮起 + 背景高亮；移出落下。
+    /// 不做横向缩放——近满宽的行以中心放大会把行内文字左右各推出 4pt+，与邻行错位（观感「浮歪」）
     override func mouseEntered(with event: NSEvent) {
-        Motion.float(self, on: true, scale: 1.04)
+        Motion.float(self, on: true, scale: 1.0, lift: 1.2)
         hoverBg.opacity = 1
     }
 
@@ -349,7 +373,7 @@ final class RowView: NSView {
         let verb = item.isQuotaResetWindow ? "下次重置" : "到期"
         var lines = ["\(item.vendor) · \(item.name)",
                      "\(verb)：\(Fmt.absTime(item.expiresAt))（\(Fmt.countdown(until: item.expiresAt, now: now))）",
-                     "来源：\(item.isAuto ? "官方本地数据" : "手动添加") · 提前\(Int(item.alertBeforeMinutes))分钟提醒"]
+                     "来源：\(item.isAuto ? "官方本地数据" : "手动添加")"]
         if let used = item.usedPercent {
             var pace = "额度剩余 \(Int(100 - used))%"
             let delta = paceDelta(item, now: now)
@@ -360,11 +384,15 @@ final class RowView: NSView {
         return lines.joined(separator: "\n")
     }
 
-    /// 红色规则：仅剩 24 小时内标红；额度用尽（剩余 0%）时改为白色提示，其余全绿
+    /// 颜色规则：额度用尽（0%）白色提示；到期前 24h 与过期 24h 内红色；
+    /// 过期更久转灰（临近 3 天自动归档），其余全绿
     static func urgencyColor(_ item: SubItem, now: Date) -> NSColor {
         let remain = item.expiresAt.timeIntervalSince(now)
         if let used = item.usedPercent, used >= 100 {
             return NSColor(white: 0.92, alpha: 1)                                // 额度耗尽：白色
+        }
+        if remain < -24 * 3600 {
+            return NSColor(white: 0.55, alpha: 1)                                // 过期超 1 天：灰
         }
         if remain <= 24 * 3600 {
             return NSColor(red: 1.0, green: 0.32, blue: 0.30, alpha: 1)          // 24 小时内：红
@@ -491,12 +519,15 @@ final class InlineEditView: NSView {
     @objc private func doneTapped() { onDone?() }
 }
 
-// MARK: - 添加 / 编辑表单（Sheet，玻璃质感）
+// MARK: - 添加 / 编辑表单（Sheet，极简）
+// 只问「名称(可选) / 到期时间 / 供应商(可选)」；周期、重置模式、伴生重置窗口、命名
+// 一律由 Store.saveInferred 在保存时从厂商规则库与同供应商历史自动推断，不再手填。
 
 final class EditorSheetController: NSWindowController {
-    /// 返回 false = 写入失败（表单保持打开、输入保留）
-    var onSave: ((SubItem) -> Bool)?
-    var onSaveMany: (([SubItem]) -> Bool)?
+    /// 保存回调。previousExpiry != nil = 编辑（保留既有重置规则，滚动伴生按到期差值平移）；
+    /// weeklyAnchor != nil = 订阅周额度重置（按官方节奏拆第k/n周组）；两者都 nil 时按 kind 走
+    /// saveWindow（周期窗口）或 saveInferred（智能推断）。返回 false = 写入失败（表单保持打开）。
+    var onSave: ((SubItem, Date?, Date?) -> Bool)?
     /// 返回 true = 已确认删除（此时表单应关闭）；false = 用户取消（表单保持打开）
     var onDelete: ((String) -> Bool)?
 
@@ -504,40 +535,27 @@ final class EditorSheetController: NSWindowController {
     static var showsSaveFailureAlerts = true
     /// 最近一次保存失败的提示文案（含部分失败）；自测断言用
     static var lastSaveFailureMessage: String?
-    /// 自测注入点：非 nil 时替代真实的周重置同步（TestRender 验证部分失败边界）
-    var quotaResetSyncOverride: ((SubItem, Bool, Date) -> Bool)?
 
     private var item: SubItem
     private let isNew: Bool
+    private let previousExpiry: Date
 
     private let nameField = NSTextField(string: "")
     private let vendorCombo = NSComboBox()
-    private let kindPopup = NSPopUpButton()
-    private let datePicker = NSDatePicker()       // 一行式日期时间（分段点击键入）
-    private let repeatField = NSTextField(string: "5")
-    private let alertField = NSTextField(string: "60")
-    private let alertStepper = NSStepper()
-    private let noteField = NSTextField(string: "")
-    private let weeklyCheck = NSButton(checkboxWithTitle: "",
-                                       target: nil,
-                                       action: nil)
-    private let resetCheck = NSButton(checkboxWithTitle: "",
-                                      target: nil,
-                                      action: nil)
-    private let resetModePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let resetParamField = NSTextField(string: "")
-    private let nextPreviewLabel = NSTextField(labelWithString: "")
-    private let vendorHintLabel = NSTextField(labelWithString: "")
-    private let purchasePicker = NSDatePicker()
-    private let inferenceLabel = NSTextField(labelWithString: "")
-    private let resetPicker = NSDatePicker()
-    private weak var formGrid: NSGridView?
-    private var lastExpiry: Date?
+    /// 类型档位：0 一次性 / 1 订阅周额度重置 / 2 每周窗口 / 3 每月窗口 / 4 5小时窗口 / 5 动态「保持现有」
+    private let typePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    /// 「订阅 · 周额度重置」档的首次重置锚点（官方节奏起点；缺省 = 现在 + 7 天）
+    private let firstResetPicker = NSDatePicker()
+    private var firstResetRow: NSGridRow?
+    private let datePicker = NSDatePicker()
+    private let previewLabel = NSTextField(labelWithString: "")
+    private let statusLabel = NSTextField(labelWithString: "")
 
     init(item: SubItem, isNew: Bool) {
         self.item = item
         self.isNew = isNew
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 430, height: 392),
+        self.previousExpiry = item.expiresAt
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 430, height: 262),
                            styleMask: [.titled],
                            backing: .buffered, defer: false)
         Glass.glassWindow(win)
@@ -548,77 +566,104 @@ final class EditorSheetController: NSWindowController {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// 当前输入组合解析出的供应商（与 Store.saveInferred 同规则，仅用于实时预览）
+    private func resolvedVendor() -> String {
+        let v = vendorCombo.stringValue.trimmingCharacters(in: .whitespaces)
+        if !v.isEmpty { return v }
+        return VendorResetKnowledge.vendor(for: nameField.stringValue) ?? "未分类"
+    }
+
+    /// 保存时底层将如何处理（仅预览；真正的写入在 Store.saveInferred / saveWindow / saveWeeklySplit）
+    private func updatePreview() {
+        firstResetRow?.isHidden = typePopup.indexOfSelectedItem != 1
+        switch typePopup.indexOfSelectedItem {
+        case 1:
+            let span = datePicker.dateValue.timeIntervalSince(firstResetPicker.dateValue)
+            guard span.isFinite, span >= 0, span < 520 * 7 * 86400 else {
+                previewLabel.stringValue = "最多拆分 520 周，请检查首次重置和到期日期"
+                break
+            }
+            let plan = QuotaAdvice.weeklyPlan(expiry: datePicker.dateValue,
+                                              firstReset: firstResetPicker.dateValue)
+            let schedule = plan.resets.map { Fmt.shortDate($0) }.joined(separator: " → ")
+            previewLabel.stringValue = "排期共 \(plan.resets.count) 轮：\(schedule)\n" + plan.advice.joined(separator: "\n")
+        case 2:
+            previewLabel.stringValue = "周期额度：每 7 天滚动一轮，到期自动滚入下一轮（窗口起点倒推为 到期−7天）"
+        case 3:
+            previewLabel.stringValue = "周期额度：每 30 天滚动一轮，到期自动滚入下一轮（窗口起点倒推为 到期−30天）"
+        case 4:
+            previewLabel.stringValue = "周期额度：每 5 小时滚动一轮，到期自动滚入下一轮（窗口起点倒推为 到期−5小时）"
+        case 5:
+            previewLabel.stringValue = "周期额度：每 2 小时滚动一轮，到期自动滚入下一轮（窗口起点倒推为 到期−2小时，Grok 短窗口适用）"
+        case 6:
+            previewLabel.stringValue = "周期额度：保持现有周期与重置规则，仅更新名称/供应商/到期时间"
+        default:
+            previewLabel.stringValue = "只记录到期日，不自动生成额度窗口；需要循环请选择周期额度"
+
+        }
+    }
+
+    /// 拆分预览用的名称（与 saveWeeklySplit 命名同源：空名称回退到供应商）
+    private func displayName() -> String {
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? resolvedVendor() : name
+    }
+
+    /// 按条目现状回填类型档位；非标准周期的旧条目动态插入「保持现有」档避免误改
+    private func loadTypeSelection() {
+        guard item.kind == .window else {
+            typePopup.selectItem(at: 0)
+            return
+        }
+        if let rule = item.resetRule, rule != .rolling {
+            typePopup.insertItem(withTitle: "周期额度 · 日历锚定（保持现有规则）", at: 6)
+            typePopup.selectItem(at: 6)
+        } else if let h = item.repeatHours {
+            switch h {
+            case 5: typePopup.selectItem(at: 4)
+            case 2: typePopup.selectItem(at: 5)
+            case 720: typePopup.selectItem(at: 3)
+            case 168: typePopup.selectItem(at: 2)
+            default:
+                typePopup.insertItem(withTitle: "周期额度 · 每 \(Int(h)) 小时（保持现有周期）", at: 6)
+                typePopup.selectItem(at: 6)
+            }
+        } else {
+            typePopup.selectItem(at: 2)   // 无周期的旧窗口：保存时修复为每周滚动
+        }
+    }
+
     private func buildForm() {
-        nameField.placeholderString = "例：Grok 重置卡 / ChatGPT Plus 年付"
+        nameField.placeholderString = "可选，留空自动命名"
+        nameField.target = self
+        nameField.action = #selector(inputChanged)   // 名称影响供应商识别 → 刷新预览
         vendorCombo.addItems(withObjectValues: ["OpenAI", "Anthropic", "xAI", "Google", "中转站", "其他"])
         vendorCombo.completes = true
-        kindPopup.addItems(withTitles: ["订阅 / 会员 / 重置卡到期", "周期额度窗口（到期自动滚动）"])
-        kindPopup.target = self
-        kindPopup.action = #selector(kindChanged)
-        // 一行式日期时间：分段点击直接键入数字，方向键微调，无需删除键
+        vendorCombo.placeholderString = "可选，留空按名称识别"
+        vendorCombo.target = self
+        vendorCombo.action = #selector(inputChanged)
+        typePopup.addItems(withTitles: ["一次性到期", "订阅 · 周额度重置（第k/n周）", "周期额度 · 每周（7天）", "周期额度 · 每月（30天）", "周期额度 · 5小时", "周期额度 · 2小时"])
+        typePopup.font = .systemFont(ofSize: 11)
+        typePopup.target = self
+        typePopup.action = #selector(inputChanged)
+        firstResetPicker.datePickerElements = [.yearMonthDay, .hourMinute]
+        firstResetPicker.datePickerStyle = .textField
+        firstResetPicker.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        firstResetPicker.dateValue = item.expiresAt   // 默认保留用户已填写的本轮到期锚点；可明确改为实际首次重置
+        firstResetPicker.target = self
+        firstResetPicker.action = #selector(inputChanged)
         datePicker.datePickerElements = [.yearMonthDay, .hourMinute]
         datePicker.datePickerStyle = .textField
+        datePicker.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         datePicker.target = self
-        datePicker.action = #selector(expiryChanged)
-        repeatField.placeholderString = "周期小时数，例：5"
-        alertField.placeholderString = "提前多少分钟提醒"
-        noteField.placeholderString = "备注（可选）"
-        weeklyCheck.title = "按周划分额度提醒（每周一条，到期分别提醒）"
-        weeklyCheck.font = NSFont.systemFont(ofSize: 11)
-        weeklyCheck.target = self
-        weeklyCheck.action = #selector(weeklyChanged)
+        datePicker.action = #selector(inputChanged)
+        previewLabel.font = .systemFont(ofSize: 9.5)
+        previewLabel.textColor = .secondaryLabelColor
+        previewLabel.maximumNumberOfLines = 3   // 排期 + 建议可占多行
+        statusLabel.font = .systemFont(ofSize: 9)
+        statusLabel.textColor = .systemRed
+        statusLabel.isHidden = true
 
-        // 周额度重置：独立于到期日。模式决定模型——滚动(锚点+N小时) / 日历锚定(固定月日·星期) / 订阅日锚定月
-        resetCheck.title = "周期重置 · 独立于到期日"
-        resetCheck.font = NSFont.systemFont(ofSize: 11)
-        resetCheck.target = self
-        resetCheck.action = #selector(resetToggled)
-        resetModePopup.addItems(withTitles: ["滚动 7 天", "滚动 30 天（1个月）", "滚动 60 天（2个月）", "滚动 90 天（3个月）", "滚动 180 天", "滚动 365 天", "每月固定日", "每周固定星期", "订阅日锚定月"])
-        resetModePopup.font = .systemFont(ofSize: 10.5)
-        resetModePopup.target = self
-        resetModePopup.action = #selector(resetModeChanged)
-        resetParamField.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        resetParamField.placeholderString = "17"
-        resetParamField.target = self
-        resetParamField.action = #selector(resetParamChanged)
-        nextPreviewLabel.font = .systemFont(ofSize: 9.5)
-        nextPreviewLabel.textColor = .secondaryLabelColor
-        let resetRow1 = NSStackView(views: [resetCheck, resetModePopup])
-        resetRow1.orientation = .horizontal
-        resetRow1.spacing = 8
-        let resetRow2 = NSStackView(views: [resetPicker, resetParamField, nextPreviewLabel])
-        resetRow2.orientation = .horizontal
-        resetRow2.spacing = 8
-        // 购买时间：推断重置模型的关键输入
-        let purchaseLabel = NSTextField(labelWithString: "购买:")
-        purchaseLabel.font = .systemFont(ofSize: 10)
-        purchaseLabel.textColor = .secondaryLabelColor
-        purchasePicker.datePickerElements = [.yearMonthDay, .hourMinute]
-        purchasePicker.datePickerStyle = .textField
-        purchasePicker.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        purchasePicker.target = self
-        purchasePicker.action = #selector(purchaseChanged)
-        let purchaseRow = NSStackView(views: [purchaseLabel, purchasePicker])
-        purchaseRow.orientation = .horizontal
-        purchaseRow.spacing = 6
-        inferenceLabel.font = .systemFont(ofSize: 9.5)
-        inferenceLabel.textColor = .systemTeal
-        inferenceLabel.maximumNumberOfLines = 2
-        let resetRow = NSStackView(views: [resetRow1, resetRow2, purchaseRow, inferenceLabel])
-        resetRow.orientation = .vertical
-        resetRow.alignment = .leading
-        resetRow.spacing = 4
-
-        // 供应商重置规则提示（调研知识库，来源见 RESEARCH.md）
-        vendorHintLabel.font = .systemFont(ofSize: 9.5)
-        vendorHintLabel.textColor = .tertiaryLabelColor
-        vendorHintLabel.maximumNumberOfLines = 2
-        vendorHintLabel.setAccessibilityIdentifier("vendorHint")
-        vendorCombo.target = self
-        vendorCombo.action = #selector(vendorChanged)
-        updateVendorHint()
-
-        // 快捷调整：一键设到期时间
         func quickBtn(_ title: String, _ seconds: TimeInterval) -> NSButton {
             let b = HoverEffectButton(title: title, target: self, action: #selector(quickSet(_:)))
             b.bezelStyle = .rounded
@@ -626,33 +671,35 @@ final class EditorSheetController: NSWindowController {
             b.tag = Int(seconds)
             return b
         }
-        let quickRow = NSStackView(views: [quickBtn("＋1小时", 3600),
-                                           quickBtn("＋1天", 86400),
-                                           quickBtn("＋1周", 7 * 86400),
-                                           quickBtn("＋30天", 30 * 86400)])
+        let quickRow = NSStackView(views: [quickBtn("＋1小时", 3600), quickBtn("＋1天", 86400),
+                                           quickBtn("＋1周", 7 * 86400), quickBtn("＋30天", 30 * 86400)])
         quickRow.orientation = .horizontal
         quickRow.spacing = 6
+        let dateRow = NSStackView(views: [datePicker, quickRow])
+        dateRow.orientation = .horizontal
+        dateRow.spacing = 8
 
-        // 提前提醒：输入框 + 步进器（点击 ±15 分钟）
-        alertStepper.minValue = 0
-        alertStepper.maxValue = 4320
-        alertStepper.increment = 15
-        alertStepper.target = self
-        alertStepper.action = #selector(stepperChanged)
-        let alertRow = NSStackView(views: [alertField, alertStepper])
-        alertRow.orientation = .horizontal
-        alertRow.spacing = 4
-
-        let labels = ["名称", "供应商", "厂商规则", "类型", "周额度重置", "划分周额度", "到期时间", "快捷调整", "周期(小时)", "提前提醒(分)", "备注"]
-        let fields: [NSView] = [nameField, vendorCombo, vendorHintLabel, kindPopup, resetRow, weeklyCheck, datePicker, quickRow, repeatField, alertRow, noteField]
-        let rows: [[NSView]] = zip(labels, fields).map { label, field in
-            let l = NSTextField(labelWithString: label)
+        func label(_ text: String) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
             l.font = .systemFont(ofSize: 11)
-            return [l, field]
+            return l
         }
-        let grid = NSGridView(views: rows)
-        formGrid = grid
-        grid.column(at: 0).xPlacement = NSGridCell.Placement.trailing
+        let infoStack = NSStackView(views: [previewLabel, statusLabel])
+        infoStack.orientation = .vertical
+        infoStack.alignment = .leading
+        infoStack.spacing = 3
+
+        let grid = NSGridView(views: [
+            [label("名称"), nameField],
+            [label("类型"), typePopup],
+            [label("到期时间"), dateRow],
+            [label("首次重置"), firstResetPicker],
+            [label("供应商"), vendorCombo],
+            [NSView(), infoStack],
+        ])
+        firstResetRow = grid.row(at: 3)
+        firstResetRow?.isHidden = true
+        grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 0).width = 80
         grid.rowSpacing = 8
         grid.columnSpacing = 8
@@ -660,6 +707,7 @@ final class EditorSheetController: NSWindowController {
 
         let deleteBtn = HoverEffectButton(title: "删除", target: self, action: #selector(deleteClicked))
         deleteBtn.contentTintColor = .systemRed
+        deleteBtn.isHidden = isNew            // 新建无物可删
         let cancelBtn = HoverEffectButton(title: "取消", target: self, action: #selector(cancelClicked))
         cancelBtn.keyEquivalent = "\u{1b}"
         let saveBtn = HoverEffectButton(title: "保存", target: self, action: #selector(saveClicked))
@@ -686,10 +734,10 @@ final class EditorSheetController: NSWindowController {
             glass.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             glass.trailingAnchor.constraint(equalTo: container.trailingAnchor),
 
-            grid.topAnchor.constraint(equalTo: container.topAnchor, constant: 32),
+            grid.topAnchor.constraint(equalTo: container.topAnchor, constant: 18),
             grid.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
             grid.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
-            btnRow.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 12),
+            btnRow.topAnchor.constraint(greaterThanOrEqualTo: grid.bottomAnchor, constant: 12),
             btnRow.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
             btnRow.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
             btnRow.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
@@ -699,166 +747,18 @@ final class EditorSheetController: NSWindowController {
     private func load() {
         nameField.stringValue = item.name
         vendorCombo.stringValue = item.vendor
-        kindPopup.selectItem(at: item.kind == .window ? 1 : 0)
         datePicker.dateValue = item.expiresAt
-        lastExpiry = item.expiresAt
-        if let h = item.repeatHours { repeatField.stringValue = String(format: "%g", h) }
-        alertField.stringValue = String(format: "%g", item.alertBeforeMinutes)
-        noteField.stringValue = item.note
-        weeklyCheck.state = .off
-        // 按伴生窗口的规则回填模式；新增默认滚动 7 天（首次重置 = 到期+7天）
-        if let comp = Store.shared.manualItems.first(where: { $0.id == Self.quotaResetId(for: item.id) }) {
-            resetCheck.state = .on
-            switch comp.resetRule {
-            case .calendarMonth:
-                resetModePopup.selectItem(at: 6)
-                resetParamField.stringValue = String(comp.resetParam ?? 1)
-            case .calendarWeek:
-                resetModePopup.selectItem(at: 7)
-                resetParamField.stringValue = String(comp.resetParam ?? 1)
-            case .anchorMonth:
-                resetModePopup.selectItem(at: 8)
-                resetParamField.stringValue = String(comp.resetParam ?? 1)
-            case .rolling, nil:
-                // 滚动档位：按 repeatHours 反推天数（7/30/60/90/180/365），未知就近兜底
-                let days = Int((comp.repeatHours ?? 168) / 24)
-                resetModePopup.selectItem(at: Self.rollingDayOptions.firstIndex(of: days) ?? 0)
-                resetPicker.dateValue = comp.expiresAt
-            }
-        } else {
-            resetCheck.state = .off
-            resetModePopup.selectItem(at: 0)
-            resetPicker.dateValue = item.expiresAt.addingTimeInterval(168 * 3600)
-        }
-        updateResetControls()
-        updateVendorHint()
-        purchasePicker.dateValue = item.expiresAt.addingTimeInterval(-28 * 86400)
-        kindChanged()
+        loadTypeSelection()
+        updatePreview()
     }
 
-    @objc private func kindChanged() {
-        let isWindow = kindPopup.indexOfSelectedItem == 1
-        // 行号见 buildForm 顺序：2 = 厂商提示，4 = 周额度重置，5 = 划分周额度，8 = 周期(小时)
-        formGrid?.row(at: 8).isHidden = !isWindow
-        formGrid?.row(at: 4).isHidden = isWindow
-        formGrid?.row(at: 5).isHidden = isWindow
-    }
+    // 表单极简后任何输入变化都只影响推断预览，共用一个刷新入口
+    @objc private func inputChanged() { updatePreview() }
 
-    @objc private func vendorChanged() {
-        updateVendorHint()
-    }
-
-    /// 供应商 → 调研知识库提示（详见 RESEARCH.md）
-    private func updateVendorHint() {
-        vendorHintLabel.stringValue = VendorResetKnowledge.hint(for: vendorCombo.stringValue) ?? ""
-    }
-
-    @objc private func resetModeChanged() {
-        updateResetControls()
-    }
-
-    @objc private func resetParamChanged() {
-        updateNextPreview()
-    }
-
-    /// 滚动档位（弹窗 index 0-5）对应的天数；index ≥ 档位数 = 日历模型
-    static let rollingDayOptions: [Int] = [7, 30, 60, 90, 180, 365]
-    private var isCalendarMode: Bool { resetModePopup.indexOfSelectedItem >= Self.rollingDayOptions.count }
-
-    /// 按模式切换输入控件：滚动=锚点日期；日历=单个数字参数（月日/星期几）+ 下次重置预览
-    private func updateResetControls() {
-        let mode = resetModePopup.indexOfSelectedItem
-        resetPicker.isHidden = isCalendarMode       // 滚动档位用锚点日期
-        resetParamField.isHidden = !isCalendarMode  // 日历档位用数字参数
-        nextPreviewLabel.isHidden = !isCalendarMode
-        resetParamField.placeholderString = mode == 7 ? "星期几（1=周一…7=周日）" : "几号（1-31）"
-        updateNextPreview()
-    }
-
-    /// 「一个数字」交互：输入 17 = 每月 17 号 00:00 重置；输入 1 = 每周一 00:00 重置
-    private func updateNextPreview() {
-        let mode = resetModePopup.indexOfSelectedItem
-        guard isCalendarMode else {
-            nextPreviewLabel.stringValue = "自下次重置起，每 \(Self.rollingDayOptions[mode]) 天滚动一轮"
-            return
-        }
-        let rule: ResetRule? = mode == 6 ? .calendarMonth : mode == 7 ? .calendarWeek : .anchorMonth
-        let param = sanitizedResetParam(mode: mode)
-        var probe = item
-        probe.resetRule = rule
-        probe.resetParam = param
-        if let next = probe.nextCalendarReset(after: Date()) {
-            let f = DateFormatter()
-            f.dateFormat = "yyyy-MM-dd 00:00"
-            nextPreviewLabel.stringValue = "下次重置：" + f.string(from: next)
-        } else {
-            nextPreviewLabel.stringValue = "参数无效"
-        }
-    }
-
-    /// 参数清洗：月日 1-31；星期 1-7（1=周一）
-    private func sanitizedResetParam(mode: Int) -> Int {
-        let raw = Int(resetParamField.stringValue.trimmingCharacters(in: .whitespaces)) ?? 1
-        return mode == 2 ? min(max(raw, 1), 7) : min(max(raw, 1), 31)
-    }
-
-    @objc private func weeklyChanged() {
-        // 两种周策略互斥：按周划分 = 静态拆分提醒；周额度重置 = 滚动窗口
-        if weeklyCheck.state == .on { resetCheck.state = .off }
-    }
-
-    @objc private func resetToggled() {
-        if resetCheck.state == .on { weeklyCheck.state = .off }
-    }
-
-    @objc private func expiryChanged() {
-        // 滚动模式（7~365 天）：到期日变化平移重置锚点（与 Store 层 align_reset 一致）；
-        // 日历锚定模式（每月N号/每周X/订阅日锚定）独立于到期日，不平移
-        if resetModePopup.indexOfSelectedItem < Self.rollingDayOptions.count, let previous = lastExpiry {
-            resetPicker.dateValue = resetPicker.dateValue.addingTimeInterval(
-                datePicker.dateValue.timeIntervalSince(previous))
-        }
-        lastExpiry = datePicker.dateValue
-        inferFromDates()
-    }
-
-    @objc private func purchaseChanged() {
-        inferFromDates()
-    }
-
-    @objc private func resetDateChanged() {
-        inferFromDates()
-    }
-
-    /// 三时间（购买/到期/最近重置）自动推断重置模型并应用——用户无需手动选模式
-    private func inferFromDates() {
-        guard resetCheck.state == .on else { return }
-        let result = ResetInference.infer(purchase: purchasePicker.dateValue,
-                                          expiry: datePicker.dateValue,
-                                          lastReset: resetPicker.dateValue)
-        switch result.rule {
-        case .calendarMonth: resetModePopup.selectItem(at: 6)
-        case .calendarWeek:  resetModePopup.selectItem(at: 7)
-        case .anchorMonth:   resetModePopup.selectItem(at: 8)
-        case .rolling:
-            let days = max(1, result.param ?? 7)
-            resetModePopup.selectItem(at: Self.rollingDayOptions.firstIndex(of: days) ?? 0)
-        }
-        if result.rule == .calendarMonth || result.rule == .calendarWeek || result.rule == .anchorMonth {
-            resetParamField.stringValue = String(result.param ?? 1)
-        }
-        inferenceLabel.stringValue = "已推断：" + result.explain
-        updateResetControls()
-    }
-
-    /// 快捷按钮始终沿已填写的时间累加，保留原周期。
+    /// 快捷按钮始终沿已填写的时间累加
     @objc private func quickSet(_ sender: NSButton) {
         datePicker.dateValue = datePicker.dateValue.addingTimeInterval(TimeInterval(sender.tag))
-        expiryChanged()
-    }
-
-    @objc private func stepperChanged() {
-        alertField.stringValue = String(Int(alertStepper.doubleValue))
+        updatePreview()
     }
 
     @objc private func cancelClicked() {
@@ -873,28 +773,57 @@ final class EditorSheetController: NSWindowController {
     }
 
     @objc private func saveClicked() {
+        var it = item
         let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        expiryChanged()
-        item.name = name
-        item.vendor = vendorCombo.stringValue.isEmpty ? "未分类" : vendorCombo.stringValue
-        item.kind = kindPopup.indexOfSelectedItem == 1 ? .window : .subscription
-        item.expiresAt = datePicker.dateValue
-        item.repeatHours = item.kind == .window ? Double(repeatField.stringValue) : nil
-        item.alertBeforeMinutes = Double(alertField.stringValue) ?? 60
-        item.note = noteField.stringValue
-        item.source = "manual"
-
-        var savedParent: Bool
-        if item.kind == .subscription && weeklyCheck.state == .on {
-            savedParent = onSaveMany?(item.splitWeekly()) ?? false
-        } else {
-            savedParent = onSave?(item) ?? false
+        it.name = (isNew || !name.isEmpty) ? name : item.name   // 编辑时清空名称视为不改
+        // 供应商留空原样上交：保存管线会按名称识别厂商，表单预览与底层用同一套规则
+        it.vendor = vendorCombo.stringValue.trimmingCharacters(in: .whitespaces)
+        it.expiresAt = datePicker.dateValue
+        it.source = "manual"
+        // 类型档位：显式声明优先于推断；「保持现有」档不动周期与重置规则
+        var weeklyAnchor: Date?
+        switch typePopup.indexOfSelectedItem {
+        case 1:
+            // 订阅 · 周额度重置：官方节奏自首次重置每 7 天一档，拆「第k/n周」组
+            let anchor = firstResetPicker.dateValue
+            guard anchor <= it.expiresAt else {
+                statusLabel.stringValue = "首次重置需早于（或等于）订阅到期"
+                statusLabel.isHidden = false
+                return
+            }
+            if !isNew, item.groupID != nil {
+                statusLabel.stringValue = "该条目已属周额度组：请直接编辑单条，或删除整组后重新添加"
+                statusLabel.isHidden = false
+                return
+            }
+            weeklyAnchor = anchor
+        case 2, 3, 4, 5:
+            it.kind = .window
+            it.repeatHours = [168.0, 720.0, 5.0, 2.0][typePopup.indexOfSelectedItem - 2]
+            it.resetRule = .rolling
+            it.resetParam = it.repeatHours!.truncatingRemainder(dividingBy: 24) == 0
+                ? Int(it.repeatHours! / 24) : nil
+            if let h = it.repeatHours {
+                it.purchaseAt = it.expiresAt.addingTimeInterval(-h * 3600)   // 倒推窗口起点
+            }
+        case 6:
+            if let h = it.repeatHours {
+                it.purchaseAt = it.expiresAt.addingTimeInterval(-h * 3600)   // 倒推窗口起点
+            }
+        default:
+            it.kind = .subscription
+            it.repeatHours = nil
+            it.resetRule = nil
+            it.resetParam = nil
         }
+
         Self.lastSaveFailureMessage = nil
-        guard savedParent else {
+        let saved = onSave?(it, isNew ? nil : previousExpiry, weeklyAnchor) ?? false
+        guard saved else {
             // 写入失败：表单保持打开、输入原样保留，用户可直接重试
             Self.lastSaveFailureMessage = "保存失败"
+            statusLabel.stringValue = "保存失败，请重试"
+            statusLabel.isHidden = false
             if Self.showsSaveFailureAlerts {
                 let alert = NSAlert()
                 alert.messageText = "保存失败"
@@ -903,87 +832,13 @@ final class EditorSheetController: NSWindowController {
             }
             return
         }
-        // 周额度重置：到期日只管订阅终止；重置节奏由模式决定（滚动 7~365 天 / 日历锚定）
-        let mode = resetModePopup.indexOfSelectedItem
-        let rule: ResetRule? = mode < Self.rollingDayOptions.count
-            ? .rolling
-            : mode == 6 ? .calendarMonth : mode == 7 ? .calendarWeek : .anchorMonth
-        let param: Int? = mode < Self.rollingDayOptions.count ? Self.rollingDayOptions[mode] : sanitizedResetParam(mode: mode)
-        let resetEnabled = item.kind == .subscription && resetCheck.state == .on && weeklyCheck.state != .on
-        let hadCompanion = Store.shared.manualItems.contains { $0.id == Self.quotaResetId(for: item.id) }
-        let resetSaved = quotaResetSyncOverride?(item, resetEnabled, resetPicker.dateValue)
-            ?? syncQuotaReset(parent: item, enabled: resetEnabled, rule: rule, param: param, anchor: resetPicker.dateValue)
         window?.sheetParent?.endSheet(window!)
-        if !resetSaved {
-            // 部分失败边界：主条目已保存成功，仅派生窗口未同步；按伴生是否存在给出准确指引
-            Self.lastSaveFailureMessage =
-                resetEnabled
-                    ? (hadCompanion
-                       ? "订阅已保存，但周额度重置时间未能更新（保持原值）。请重新打开该条目并再次保存以重试。"
-                       : "订阅已保存，但周额度重置未能启用：请重新打开该条目、勾选周期重置并保存。")
-                    : "订阅已保存，但旧的周额度重置窗口移除失败"
-        }
-        // 汇总部分失败（闭包内对齐失败 / 派生窗口同步失败）并统一反馈
         if let msg = Self.lastSaveFailureMessage, Self.showsSaveFailureAlerts {
             let alert = NSAlert()
             alert.messageText = "部分保存失败"
             alert.informativeText = msg
             alert.runModal()
         }
-    }
-
-    /// 周重置窗口的确定性 id：跟随父订阅，编辑时反查、保存时幂等更新
-    static func quotaResetId(for parentID: String) -> String { "qreset:" + parentID }
-
-    /// 生成 / 更新 / 移除与订阅关联的周期重置窗口。返回写入是否成功。
-    /// rolling：anchor 为下次重置时间（由 rollManualWindows 按 repeatHours 滚动）；
-    /// 日历模型：resetRule/resetParam 决定节点，expiresAt = 下一个未来节点（离线不累积）。
-    @discardableResult
-    private func syncQuotaReset(parent: SubItem, enabled: Bool, rule: ResetRule?, param: Int?, anchor: Date) -> Bool {
-        let cid = Self.quotaResetId(for: parent.id)
-        guard enabled else {
-            if Store.shared.manualItems.contains(where: { $0.id == cid }) {
-                return Store.shared.deleteManual(id: cid)
-            }
-            return true
-        }
-        var c: SubItem
-        if let existing = Store.shared.manualItems.first(where: { $0.id == cid }) {
-            c = existing
-        } else {
-            c = SubItem.manualDefault(name: "", vendor: parent.vendor)
-            c.id = cid
-            c.kind = .window
-            c.groupID = parent.groupID ?? parent.id
-        }
-        let calendar = rule == .calendarMonth || rule == .calendarWeek || rule == .anchorMonth
-        c.name = parent.name.isEmpty ? "周期重置" : "\(parent.name)·周期重置"
-        c.vendor = parent.vendor
-        c.alertBeforeMinutes = parent.alertBeforeMinutes
-        if calendar, let rule, let param {
-            c.resetRule = rule
-            c.resetParam = param
-            c.repeatHours = nil
-            c.expiresAt = c.nextCalendarReset(after: Date()) ?? anchor
-            switch rule {
-            case .calendarMonth:
-                c.note = "「\(parent.name)」每月 \(param) 日 00:00 重置额度，独立于到期日"
-            case .calendarWeek:
-                let names = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-                c.note = "「\(parent.name)」每周 \(names[param]) 00:00 重置额度，独立于到期日"
-            default:
-                c.note = "「\(parent.name)」每月订阅日 00:00 重置额度（订阅日锚定月）"
-            }
-        } else {
-            // 滚动档位：param 即天数（7/30/60/90/180/365），写入 repeatHours 供 rollManualWindows 滚动
-            let days = (rule == .rolling ? param : nil) ?? 7
-            c.resetRule = .rolling
-            c.resetParam = days
-            c.repeatHours = Double(days * 24)
-            c.expiresAt = anchor
-            c.note = "「\(parent.name)」每 \(days) 天额度重置，独立于到期日自动滚动"
-        }
-        return Store.shared.upsertManual(c).saved
     }
 }
 
@@ -995,7 +850,7 @@ final class PanelController: NSObject {
         static let expandedWidth: CGFloat = 240
         static let pillWidth: CGFloat = 54
         static let pillHeight: CGFloat = 18
-        static let expandedRightMargin: CGFloat = 6
+        static let dockMargin: CGFloat = 6
         static let headerH: CGFloat = 16
         static let rowH: CGFloat = 28
         static let sectionH: CGFloat = 14
@@ -1003,6 +858,8 @@ final class PanelController: NSObject {
         static let padSide: CGFloat = 8
         static let padTop: CGFloat = 5
         static let padBottom: CGFloat = 5
+        static let pillFontSize: CGFloat = 9
+        static let pillMinFontSize: CGFloat = 6.5
     }
 
     private let panel: FloatingPanel
@@ -1010,6 +867,7 @@ final class PanelController: NSObject {
     private let titleLabel = NSTextField(labelWithString: "⏳")
     private let rowsContainer = NSView()
     private let pillLabel = NSTextField(labelWithString: "")
+    private let pillHoverOutline = PillHoverOutline()
     private let headerView = NSStackView()
 
     private var currentIds: [String] = []
@@ -1017,7 +875,14 @@ final class PanelController: NSObject {
     private weak var activeInlineView: InlineEditView?
     private var autoItems: [SubItem] = []
     private var refreshing = false
+    private var hiddenByUser = false
     private var tickCount = 0
+    /// deadline 驱动的窗口滚动：只有跨过下一个重置节点才碰 Store，杜绝每秒空转遍历
+    private var rollDeadline: Date = .distantPast   // 启动首次 tick 必滚（补睡眠/离线期间）
+    /// dataVersion 驱动的重建：条目集合没变就不重排、不重建
+    private var lastSeenDataVersion = -1
+    /// 已弹过 5 小时临界弹窗的条目（id@到期瞬间）：同一到期只弹一次，重启后仍在 5h 内会再弹一次
+    private var alertedKeys = Set<String>()
     private var statusItem: NSStatusItem?
     private var settings: SettingsWindowController?
     private var activeEditors: [EditorSheetController] = []
@@ -1051,7 +916,7 @@ final class PanelController: NSObject {
 
         let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main
         if let f = screen?.visibleFrame {
-            panel.setFrame(NSRect(x: f.maxX - Metrics.pillWidth, y: f.maxY - 170,
+            panel.setFrame(NSRect(x: f.maxX - Metrics.dockMargin - Metrics.pillWidth, y: f.maxY - 170,
                                   width: Metrics.pillWidth, height: Metrics.pillHeight),
                            display: false)
         }
@@ -1103,22 +968,36 @@ final class PanelController: NSObject {
         container.addSubview(headerView)
         container.addSubview(rowsContainer)
         container.addSubview(pillLabel)
+        pillHoverOutline.alphaValue = 0
+        container.addSubview(pillHoverOutline)
         panel.contentView = container
 
         container.onMouseEnter = { [weak self] in
             guard let self else { return }
             self.cancelAutoCollapse()
-            // 收起态：悬停药丸浮起
-            if Store.shared.state.panelCollapsed { Motion.float(self.pillLabel, on: true, scale: 1.1) }
+            // 收起态仅提亮边缘，文字和玻璃始终保持同一位置。
+            if Store.shared.state.panelCollapsed { self.setPillHover(true) }
         }
         container.onMouseExit = { [weak self] in
             guard let self else { return }
             self.scheduleAutoCollapse()
-            if Store.shared.state.panelCollapsed { Motion.float(self.pillLabel, on: false) }
+            if Store.shared.state.panelCollapsed { self.setPillHover(false) }
         }
         container.onBackgroundClick = { [weak self] in self?.pillClicked() }
 
         effect.menu = buildContextMenu()
+    }
+
+    private func setPillHover(_ hovered: Bool) {
+        let alpha: CGFloat = hovered ? 1 : 0
+        if !Motion.enabled || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            pillHoverOutline.alphaValue = alpha
+        } else {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                pillHoverOutline.animator().alphaValue = alpha
+            }
+        }
     }
 
     /// 以「右上角」为锚点调整窗口尺寸并手动布局
@@ -1128,7 +1007,7 @@ final class PanelController: NSObject {
         let width = expanded ? Metrics.expandedWidth : Metrics.pillWidth
         let height = expanded ? contentH : Metrics.pillHeight
         let rightX = expanded ? panel.screen?.visibleFrame.maxX ?? prev.maxX : prev.maxX
-        let anchorRight = expanded ? rightX - Metrics.expandedRightMargin : rightX
+        let anchorRight = expanded ? rightX - Metrics.dockMargin : rightX
         panel.setFrame(NSRect(x: anchorRight - width, y: topY - height, width: width, height: height),
                        display: true, animate: false)
         layoutChrome()
@@ -1137,6 +1016,9 @@ final class PanelController: NSObject {
     private func layoutChrome() {
         guard let b = panel.contentView?.bounds else { return }
         let collapsed = Store.shared.state.panelCollapsed
+        pillHoverOutline.frame = b
+        pillHoverOutline.isHidden = !collapsed
+        if !collapsed { pillHoverOutline.alphaValue = 0 }
         effect.frame = b
         effect.cornerRadius = collapsed ? 9 : 18
         effect.needsDisplay = true
@@ -1147,9 +1029,7 @@ final class PanelController: NSObject {
             pillLabel.isHidden = false
             pillLabel.stringValue = pillText()
             pillLabel.toolTip = Self.upcomingTooltip(allItems)
-            pillLabel.sizeToFit()
-            pillLabel.frame = NSRect(x: 6, y: (b.height - pillLabel.frame.height) / 2,
-                                     width: b.width - 12, height: pillLabel.frame.height)
+            refitPill()
         } else {
             pillLabel.isHidden = true
             headerView.isHidden = false
@@ -1181,10 +1061,29 @@ final class PanelController: NSObject {
     }
 
     private func pillText() -> String {
-        guard let nearest = allItems.first else { return "⏳" }
+        guard let nearest = visibleItems.first else { return "⏳" }   // 归档条目不占据药丸
         let text = Fmt.countdownShort(until: nearest.expiresAt)
         pillLabel.textColor = RowView.urgencyColor(nearest, now: Date())
         return text
+    }
+
+    /// 药丸文本布局：可用宽仅 54−12=42pt，放不下就按 0.5pt 阶梯缩小字号（下限 6.5pt）防硬裁剪。
+    /// 宽度用 label 自身 intrinsicContentSize 度量——含真实字体度量与字距，比 NSAttributedString
+    /// 估算更可靠（「16时12分」估算 45.2 vs 实际 45.5，估算贴边就会漏缩）。
+    private func refitPill() {
+        let avail = container.bounds.width - 12
+        var size = Metrics.pillFontSize
+        while size > Metrics.pillMinFontSize {
+            pillLabel.font = .monospacedDigitSystemFont(ofSize: size, weight: .medium)
+            pillLabel.invalidateIntrinsicContentSize()
+            if ceil(pillLabel.intrinsicContentSize.width) <= avail { break }
+            size -= 0.5
+        }
+        pillLabel.font = .monospacedDigitSystemFont(ofSize: size, weight: .medium)
+        pillLabel.sizeToFit()
+        let b = container.bounds
+        pillLabel.frame = NSRect(x: 6, y: (b.height - pillLabel.frame.height) / 2,
+                                 width: b.width - 12, height: pillLabel.frame.height)
     }
 
     // MARK: 收起 / 展开
@@ -1261,6 +1160,11 @@ final class PanelController: NSObject {
         (autoItems + Store.shared.manualItems).sorted { $0.expiresAt < $1.expiresAt }
     }
 
+    /// 面板/药丸/菜单栏展示口径：过滤掉已自动归档的条目（仍在库中，设置后台可见可清理）
+    private var visibleItems: [SubItem] {
+        allItems.filter { !$0.isArchived }
+    }
+
     func refreshData() {
         guard !refreshing else { return }
         refreshing = true
@@ -1284,18 +1188,29 @@ final class PanelController: NSObject {
         return "最近到期\n" + lines.joined(separator: "\n")
     }
 
+    /// 每秒心跳只做「文本级」刷新；数据级工作由 deadline（滚动）与 dataVersion（重建）驱动。
+    /// 睡眠/离线补滚在 deadline 命中的那一秒一次性完成（rollManualWindows 幂等且保持相位）。
     func tick() {
-        Store.shared.rollManualWindows()
         let now = Date()
-        let items = allItems
-
-        if let btn = statusItem?.button {
-            btn.toolTip = Self.upcomingTooltip(items)
+        if now >= rollDeadline {
+            Store.shared.rollManualWindows(now: now)
+            Store.shared.archiveExpiredSubscriptions(now: now)   // 过期 3 天的手动订阅自动归档
+            Store.shared.purgeArchived(now: now)                 // 归档 30 天自动清除
+            rollDeadline = min(Store.shared.nextRollInstant() ?? .distantFuture, now.addingTimeInterval(3600))
         }
 
-        // 菜单栏实时倒计时（借鉴 Claude-Code-Usage-Monitor 的 title-format 思路）
-        if let btn = statusItem?.button {
-            btn.title = items.first.map { "⏳ " + Fmt.countdownShort(until: $0.expiresAt, now: now) } ?? "⏳"
+        let items = visibleItems
+
+        // 5 小时临界弹窗：固定在剩 5 小时时弹一次（每个到期瞬间只弹一次，内存去重）。
+        // 多条同时临期合并为一个居中模态，弹到屏幕正中央让人无法忽略。
+        let due = items.filter {
+            let remain = $0.expiresAt.timeIntervalSince(now)
+            return remain > 0 && remain <= 5 * 3600
+                && !alertedKeys.contains("\($0.id)@\($0.expiresAt.timeIntervalSince1970)")
+        }
+        if !due.isEmpty {
+            due.forEach { alertedKeys.insert("\($0.id)@\($0.expiresAt.timeIntervalSince1970)") }
+            presentExpirationAlert(due, now: now)
         }
 
         if !Store.shared.state.panelCollapsed {
@@ -1311,35 +1226,78 @@ final class PanelController: NSObject {
                     // 最后两分钟文本每秒变化，直接更新避免持续闪烁
                     pillLabel.stringValue = text
                     pillLabel.textColor = color
+                    refitPill()
                 } else {
                     Motion.crossfadeText(pillLabel) {
                         self.pillLabel.stringValue = text
                         self.pillLabel.textColor = color
+                        self.refitPill()
                     }
                 }
             }
         }
-        rebuildIfNeeded(items: items)
+
+        // 菜单栏实时倒计时（借鉴 Claude-Code-Usage-Monitor 的 title-format 思路）；文本没变不写
+        if let btn = statusItem?.button {
+            let title = items.first.map { "⏳ " + Fmt.countdownShort(until: $0.expiresAt, now: now) } ?? "⏳"
+            if btn.title != title { btn.title = title }
+        }
+
+        // 条目集合有变才重建行、刷新 tooltip；顺带把新增/编辑窗口纳入滚动 deadline
+        if Store.shared.dataVersion != lastSeenDataVersion {
+            lastSeenDataVersion = Store.shared.dataVersion
+            statusItem?.button?.toolTip = Self.upcomingTooltip(items)
+            rebuildIfNeeded(items: items)
+            if let next = Store.shared.nextRollInstant() {
+                rollDeadline = min(rollDeadline, next)
+            }
+        }
 
         tickCount += 1
         // 自愈：窗口不可见（被拖出屏幕外/切到别的空间）时，吸附回主屏右上角再拉起。
         // makeKeyAndOrderFront 救不回位于屏幕外的窗口，必须先把位置搬回可视区。
-        if tickCount % 30 == 0, !panel.occlusionState.contains(.visible) {
-            NSLog("AR: 面板不在屏上，自动恢复显示")
-            let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main
-            if let f = screen?.visibleFrame {
-                panel.setFrameOrigin(NSPoint(x: f.maxX - panel.frame.width, y: f.maxY - 170))
-                UserDefaults.standard.removeObject(forKey: "panelOrigin")   // 丢弃离屏的旧坐标
+        if tickCount % 30 == 0 {
+            if let btn = statusItem?.button { btn.toolTip = Self.upcomingTooltip(items) }
+            if !hiddenByUser && !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(panel.frame) }) {
+                NSLog("AR: 面板不在屏上，自动恢复显示")
+                let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main
+                if let f = screen?.visibleFrame {
+                    panel.setFrameOrigin(NSPoint(x: f.maxX - Metrics.dockMargin - panel.frame.width, y: f.maxY - 170))
+                    UserDefaults.standard.removeObject(forKey: "panelOrigin")   // 丢弃离屏的旧坐标
+                }
+                panel.orderFrontRegardless()
+                Motion.reveal(panel)
             }
-            panel.makeKeyAndOrderFront(nil)
-            Motion.reveal(panel)
         }
-        if tickCount % 10 == 0 { checkAlerts(items: items, now: now) }
     }
 
-    private func rebuildIfNeeded(items: [SubItem]) {
-        let ids = items.map(\.id)
-        guard ids != currentIds else { return }
+    /// 临期弹窗：NSAlert 模态默认弹在屏幕正中央；.common 模式下 tick 心跳不中断。
+    /// 弹窗本身不是提醒渠道，而是把「快到期」这件事顶到眼前——面板常驻右角易被忽视。
+    private func presentExpirationAlert(_ due: [SubItem], now: Date) {
+        let sorted = due.sorted { $0.expiresAt < $1.expiresAt }
+        let list = sorted
+            .map { "• \($0.name)——剩 \(Fmt.countdown(until: $0.expiresAt, now: now))（\(Fmt.absTime($0.expiresAt))）" }
+            .joined(separator: "\n")
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = sorted.count == 1 ? "「\(sorted[0].name)」5 小时内到期" : "\(sorted.count) 项额度 5 小时内到期"
+        alert.informativeText = list + "\n\n过期后额度即清零，请尽快安排使用。"
+        alert.addButton(withTitle: "知道了")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    private func rebuildIfNeeded(items: [SubItem]) {        let ids = items.map(\.id)
+        guard ids != currentIds else {
+            let byID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+            for case let row as RowView in rowsContainer.subviews {
+                if let id = row.item?.id, let fresh = byID[id] {
+                    row.updateItem(fresh)
+                    row.configure(fresh, now: Date())
+                }
+            }
+            return
+        }
         rebuildAll()
     }
 
@@ -1380,7 +1338,7 @@ final class PanelController: NSObject {
 
         section("额度窗口", autoItems.filter { $0.kind == .window })
         section("订阅", autoItems.filter { $0.kind == .subscription })
-        section("手动记录", Store.shared.manualItems)
+        section("手动记录", Store.shared.manualItems.filter { !$0.isArchived })
         if entries.isEmpty {
             let hint = NSTextField(labelWithString: "暂无条目，点 ＋ 添加")
             hint.font = .systemFont(ofSize: 9)
@@ -1397,13 +1355,7 @@ final class PanelController: NSObject {
         let entries = buildEntries()
         currentIds = entries.compactMap { ($0.view as? RowView)?.item?.id }
         rowsContainer.subviews.forEach { $0.removeFromSuperview() }
-        var revealInline = false
-        for (view, height) in entries {
-            if animate, view is InlineEditView {
-                view.wantsLayer = true
-                view.alphaValue = 0
-                revealInline = true
-            }
+        for (view, _) in entries {
             rowsContainer.addSubview(view)
         }
         let contentH = Metrics.padTop + Metrics.headerH + 3
@@ -1416,30 +1368,18 @@ final class PanelController: NSObject {
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             ctx.allowsImplicitAnimation = animate
             self.updateFrame(expanded: !Store.shared.state.panelCollapsed, contentH: contentH)
-            if revealInline {
-                for case let v as InlineEditView in self.rowsContainer.subviews {
-                    v.alphaValue = 1
-                }
-            }
         }, completionHandler: nil)
+
+        // 每次点开内联编辑卡都虚化渐入（blur-in），与全局点击交互语言一致
+        if animate {
+            for case let v as InlineEditView in rowsContainer.subviews {
+                Motion.reveal(v)
+            }
+        }
 
         if Store.shared.state.panelCollapsed {
             pillLabel.stringValue = pillText()
         }
-    }
-
-    // MARK: 预警
-
-    private func checkAlerts(items: [SubItem], now: Date) {
-        let outcome = AlertEngine.check(items: items,
-                                        knownKeys: Set(Store.shared.state.notifiedKeys),
-                                        now: now)
-        guard !outcome.fired.isEmpty else { return }
-        let msg = AlertEngine.composeMessage(outcome.fired)
-        Notifier.post(title: "AI 到期提醒", body: msg)
-        Feishu.send(webhook: Store.shared.state.feishuWebhook, text: msg)
-        Store.shared.state.notifiedKeys = outcome.newKeys.sorted()
-        Store.shared.save()
     }
 
     // MARK: 动作
@@ -1490,10 +1430,11 @@ final class PanelController: NSObject {
 
     /// 内联编辑卡回调
     private func inlineChange(id: String, date: Date) {
-        guard var it = Store.shared.manualItems.first(where: { $0.id == id }) else { return }
-        let persisted = it                       // 已持久化的旧值：写失败时行显示回退到此，避免假数据
+        guard let persisted = Store.shared.manualItems.first(where: { $0.id == id }) else { return }
+        var it = persisted                    // 已持久化的旧值：写失败时行显示回退到此，避免假数据
         it.expiresAt = date
-        let result = Store.shared.upsertManual(it)
+        // 编辑路径：保留既有重置模型，滚动伴生窗口锚点按到期差值平移
+        let result = Store.shared.updateManual(it, previousExpiry: persisted.expiresAt)
         let displayItem = result.saved ? it : persisted
         for case let row as RowView in rowsContainer.subviews where row.item?.id == id {
             row.updateItem(displayItem)
@@ -1542,8 +1483,6 @@ final class PanelController: NSObject {
                 autoItems.remove(at: idx)
             }
             rebuildAll(animate: true)
-            Notifier.post(title: "已隐藏：\(item.name)",
-                          body: "官方数据本地仍会更新，点 ⟳ 刷新官方数据即可恢复显示")
             return
         }
         if let gid = item.groupID {
@@ -1602,8 +1541,28 @@ final class PanelController: NSObject {
         let editor = EditorSheetController(item: item, isNew: isNew)
         editor.window?.isReleasedWhenClosed = false
         activeEditors.append(editor)   // 保活：否则控制器释放后按钮 target 变 nil
-        editor.onSave = { [weak self] savedItem in
-            let result = Store.shared.upsertManual(savedItem)
+        editor.onSave = { [weak self] savedItem, previousExpiry, weeklyAnchor in
+            EditorSheetController.lastSaveFailureMessage = nil
+            let result: ManualWriteResult
+            if let weeklyAnchor {
+                // 订阅 · 周额度重置：按官方节奏拆「第k/n周」组；编辑时替换原单条
+                result = Store.shared.saveWeeklySplit(name: savedItem.name, vendor: savedItem.vendor,
+                                                      expiry: savedItem.expiresAt, firstReset: weeklyAnchor,
+                                                      replacing: isNew ? nil : savedItem.id)
+            } else if let previousExpiry {
+                // 编辑：保留既有重置规则，滚动伴生窗口锚点由 Store 按到期差值平移；
+                // 条目转为周期窗口时冗余伴生由 Store 一并清理
+                result = Store.shared.updateManual(savedItem, previousExpiry: previousExpiry)
+            } else if savedItem.kind == .window {
+                // 新建即选周期额度：显式滚动窗口，绕过推断
+                result = Store.shared.saveWindow(name: savedItem.name, vendor: savedItem.vendor,
+                                                 expiresAt: savedItem.expiresAt,
+                                                 repeatHours: savedItem.repeatHours ?? 168)
+            } else {
+                // 一次性类型不依据供应商猜测额度窗口。
+                result = Store.shared.saveOneTime(name: savedItem.name, vendor: savedItem.vendor,
+                                                  expiresAt: savedItem.expiresAt)
+            }
             if result.saved {
                 saved()
                 self?.activeEditors.removeAll { $0 === editor }
@@ -1611,19 +1570,7 @@ final class PanelController: NSObject {
             if case .savedWithAlignFailure(let failures) = result {
                 // 明确哪些关联未同步；证据留存于 Store.lastAlignmentFailures，恢复方案另行处理
                 EditorSheetController.lastSaveFailureMessage =
-                    "订阅已保存，但以下关联未能同步：\(failures.joined(separator: "、"))"
-            }
-            return result.saved
-        }
-        editor.onSaveMany = { [weak self] savedItems in
-            let result = Store.shared.upsertManual(savedItems)
-            if result.saved {
-                saved()
-                self?.activeEditors.removeAll { $0 === editor }
-            }
-            if case .partialSaved(let written, let failed) = result {
-                EditorSheetController.lastSaveFailureMessage =
-                    "按周划分部分成员已保存（成功 \(written) 条，失败 \(failed) 条）。失败的成员未写入，请再次保存以补齐。"
+                    "已保存，但以下关联未能同步：\(failures.joined(separator: "、"))"
             }
             return result.saved
         }
@@ -1636,6 +1583,7 @@ final class PanelController: NSObject {
             return true
         }
         parent.beginSheet(editor.window!)
+        Motion.reveal(editor.window!.contentView!)   // 每次点开表单都虚化渐入
     }
 
     @objc private func openSettings() {
@@ -1652,7 +1600,6 @@ final class PanelController: NSObject {
         if !Store.shared.state.dismissedAuto.isEmpty {
             Store.shared.state.dismissedAuto = []
             Store.shared.save()
-            Notifier.post(title: "已恢复全部官方条目", body: "之前隐藏的官方数据已重新显示")
         }
         refreshData()
     }
@@ -1661,18 +1608,16 @@ final class PanelController: NSObject {
         applyCollapsed(!Store.shared.state.panelCollapsed)
     }
 
-    @objc private func hideClicked() { panel.orderOut(nil) }
+    @objc private func hideClicked() { hiddenByUser = true; panel.orderOut(nil) }
 
     @objc private func toggleVisible() {
-        if panel.isVisible { panel.orderOut(nil) } else { panel.makeKeyAndOrderFront(nil) }
+        if panel.isVisible { hideClicked() } else { hiddenByUser = false; panel.orderFrontRegardless() }
     }
 
     @objc private func toggleLaunch() {
         let nowOn = Resident.toggle()
         Store.shared.state.launchAtLogin = nowOn
         Store.shared.save()
-        Notifier.post(title: nowOn ? "已开启常驻" : "已关闭常驻",
-                      body: nowOn ? "登录自启，崩溃后自动重启" : "已从登录项移除")
     }
 
     @objc private func openDataFolder() {
@@ -1683,6 +1628,7 @@ final class PanelController: NSObject {
     @objc private func quit() { NSApp.terminate(nil) }
 
     func showPanel() {
+        hiddenByUser = false
         applyCollapsed(Store.shared.state.panelCollapsed)
         panel.makeKeyAndOrderFront(nil)
         Motion.reveal(panel)
@@ -1691,6 +1637,8 @@ final class PanelController: NSObject {
     // MARK: 自测渲染支持
 
     var debugContentView: NSView? { panel.contentView }
+    /// TestRender 断言用：药丸当前字号（验证长倒计时触发的自适应缩小）
+    var debugPillFontSize: CGFloat { pillLabel.font?.pointSize ?? 0 }
     func debugShowInlineEditor() {
         if let first = Store.shared.manualItems.first(where: { !$0.isAuto }) {
             editingId = first.id

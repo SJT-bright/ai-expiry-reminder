@@ -1,6 +1,7 @@
 import AppKit
 
-// 离屏渲染自测：把悬浮窗（展开/收起）、设置后台、添加表单渲染成 PNG 供人工检查。
+// 离屏渲染自测：把悬浮窗（展开/收起）、设置后台、编辑表单渲染成 PNG 供人工检查，
+// 并对极简表单 / 智能保存管线 / 药丸字号自适应做行为断言。
 // 只编译进测试产物（TestRender），不影响正式 .app。
 
 func snapshot(_ view: NSView, path: String) {
@@ -28,6 +29,22 @@ func snapshot(_ view: NSView, path: String) {
     try? rep.representation(using: .png, properties: [:])?
         .write(to: URL(fileURLWithPath: path))
     print("rendered: \(path)  \(Int(size.width))x\(Int(size.height))")
+    // 硬件合成截图：离屏 cacheDisplay 无法核验原生玻璃。
+    if ProcessInfo.processInfo.environment["AR_NATIVE_CAPTURE"] == "1", let window = view.window {
+        window.orderFrontRegardless()
+        window.displayIfNeeded()
+        CATransaction.flush()
+        let capture = Process()
+        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        capture.arguments = ["-x", "-o", "-l", String(window.windowNumber), path.replacingOccurrences(of: ".png", with: "-native.png")]
+        try? capture.run()
+        capture.waitUntilExit()
+        precondition(capture.terminationStatus == 0, "真实窗口截图失败，不得用离屏截图冒充")
+    }
+}
+
+func descendants(_ view: NSView) -> [NSView] {
+    [view] + view.subviews.flatMap { descendants($0) }
 }
 
 final class TestDelegate: NSObject, NSApplicationDelegate {
@@ -47,10 +64,10 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         d3.expiresAt = now.addingTimeInterval(3600 * 24 * 20)
         [d1, d2, d3].forEach { Store.shared.upsertManual($0) }
         Store.shared.upsertManual(SubItem(id: "demo:exhausted",
-                                                      name: "演示·额度耗尽", vendor: "OpenAI",
-                                                      kind: .window, expiresAt: now.addingTimeInterval(3600 * 30),
-                                                      repeatHours: 5, source: "codex", note: "",
-                                                      alertBeforeMinutes: 15, usedPercent: 100, groupID: nil))
+                                          name: "演示·额度耗尽", vendor: "OpenAI",
+                                          kind: .window, expiresAt: now.addingTimeInterval(3600 * 30),
+                                          repeatHours: 5, source: "codex", note: "",
+                                          usedPercent: 100, groupID: nil))
 
         pc = PanelController(loadOfficialData: false)
 
@@ -62,113 +79,163 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     precondition(self.pc.debugContentView!.bounds.width > 100)
                     snapshot(self.pc.debugContentView!, path: "build/render/panel_expanded.png")
-                // 2) 收起态（贴边药丸）
-                self.pc.debugSetExpanded(false)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    snapshot(self.pc.debugContentView!, path: "build/render/panel_pill.png")
-                    // 3) 设置后台
-                    let sc = SettingsWindowController(panel: self.pc)
-                    sc.showWindow(nil)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        sc.debugPrintGeometry()
-                        snapshot(sc.windowRef!.contentView!, path: "build/render/settings.png")
-                        // 4) 添加表单
-                        var example = SubItem.manualDefault(name: "ZCode", vendor: "ZCode")
-                        let f = DateFormatter()
-                        f.timeZone = TimeZone(identifier: "Asia/Shanghai")
-                        f.dateFormat = "yyyy-MM-dd HH:mm"
-                        example.expiresAt = f.date(from: "2026-09-11 15:53")!
-                        let editor = EditorSheetController(item: example, isNew: true)
-                        func descendants(_ view: NSView) -> [NSView] {
-                            [view] + view.subviews.flatMap { descendants($0) }
-                        }
-                        let controls = descendants(editor.window!.contentView!)
-                        let pickers = controls.compactMap { $0 as? NSDatePicker }
-                        let expiry = pickers.first { $0.action == NSSelectorFromString("expiryChanged") }!
-                        let reset = pickers.first { $0 !== expiry }!
-                        precondition(reset.dateValue == f.date(from: "2026-09-18 15:53")!, "首次重置必须从到期日+7天")
-                        expiry.dateValue = f.date(from: "2026-09-12 15:53")!
-                        editor.perform(NSSelectorFromString("expiryChanged"))
-                        precondition(reset.dateValue == f.date(from: "2026-09-19 15:53")!, "改到期日应同步平移")
-                        expiry.dateValue = example.expiresAt
-                        editor.perform(NSSelectorFromString("expiryChanged"))
-                        let checkbox = controls.compactMap { $0 as? NSButton }.first { $0.title.contains("周期重置") }!
-                        checkbox.state = .on
-                        editor.onSave = { Store.shared.upsertManual($0).saved }
-                        editor.perform(NSSelectorFromString("saveClicked"))
-                        let savedReset = Store.shared.manualItems.first { $0.id == "qreset:" + example.id }!
-                        precondition(savedReset.expiresAt == f.date(from: "2026-09-18 15:53")!)
-                        let reopened = EditorSheetController(item: example, isNew: false)
-                        let reopenedReset = descendants(reopened.window!.contentView!).compactMap { $0 as? NSDatePicker }.first { $0.action != NSSelectorFromString("expiryChanged") }!
-                        precondition(reopenedReset.dateValue == savedReset.expiresAt, "重新编辑不能倒退七天")
-                        reopened.onSave = { _ in true }
-                        reopened.perform(NSSelectorFromString("saveClicked"))
-                        precondition(Store.shared.manualItems.first { $0.id == savedReset.id }!.expiresAt == savedReset.expiresAt)
-                        print("PASS: 编辑表单首次锚点、平移、保存及重新编辑")
-
-                        // ── 文案识别范围：额度重置窗口称「重置」，手动通用周期窗口仍称「到期」 ──
-                        let qresetProbe = SubItem(id: "qreset:探针", name: "探针·周重置", vendor: "探针",
-                                                  kind: .window, expiresAt: now.addingTimeInterval(3600),
-                                                  repeatHours: 168, source: "manual", note: "",
-                                                  alertBeforeMinutes: 60, usedPercent: nil, groupID: nil)
-                        let autoProbe = SubItem(id: "auto:probe:300", name: "探针·5小时窗口", vendor: "OpenAI",
-                                                kind: .window, expiresAt: now.addingTimeInterval(3600),
-                                                repeatHours: 5, source: "codex", note: "",
-                                                alertBeforeMinutes: 15, usedPercent: 40, groupID: nil)
-                        var manualWindow = SubItem.manualDefault(name: "月付续费日")
-                        manualWindow.kind = .window
-                        manualWindow.repeatHours = 720
-                        precondition(AlertEngine.composeMessage([qresetProbe]).contains("重置（"), "周重置伴生窗口通知应称重置")
-                        precondition(AlertEngine.composeMessage([autoProbe]).contains("重置（"), "官方额度窗口通知应称重置")
-                        precondition(!AlertEngine.composeMessage([manualWindow]).contains("重置"), "手动通用窗口不得称重置")
-                        precondition(AlertEngine.composeMessage([manualWindow]).contains("到期（"), "手动通用窗口通知仍称到期")
-                        precondition(RowView.detailTooltip(qresetProbe, now: now).contains("下次重置"), "周重置伴生窗口 tooltip 应称下次重置")
-                        precondition(!RowView.detailTooltip(manualWindow, now: now).contains("下次重置"), "手动通用窗口 tooltip 不得称下次重置")
-                        print("PASS: 通知与 tooltip 按额度重置语义精确区分")
-
-                        // ── 保存失败：表单不关闭、输入保留、文案可断言 ──
-                        EditorSheetController.showsSaveFailureAlerts = false
-                        let failParent = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 20, height: 20),
-                                                  styleMask: [.titled], backing: .buffered, defer: false)
-                        let failEditor = EditorSheetController(item: example, isNew: false)
-                        failParent.beginSheet(failEditor.window!)
-                        let failName = descendants(failEditor.window!.contentView!)
-                            .compactMap { $0 as? NSTextField }
-                            .first { $0.placeholderString?.contains("Grok 重置卡") == true }!
-                        failName.stringValue = "失败探针"
-                        failEditor.onSave = { _ in false }
-                        failEditor.perform(NSSelectorFromString("saveClicked"))
-                        precondition(failParent.isSheet, "保存失败时表单必须保持打开")
-                        precondition(failName.stringValue == "失败探针", "保存失败时输入必须原样保留")
-                        precondition(EditorSheetController.lastSaveFailureMessage == "保存失败", "失败文案应可断言")
-                        // 成功路径恢复：表单正常关闭、条目落库
-                        failEditor.onSave = { Store.shared.upsertManual($0).saved }
-                        failEditor.perform(NSSelectorFromString("saveClicked"))
-                        precondition(!failParent.isSheet, "成功后表单正常关闭")
-                        precondition(Store.shared.manualItems.contains { $0.name == "失败探针" }, "恢复成功路径后条目已保存")
-                        print("PASS: 保存失败表单保留输入、成功路径正常关闭")
-
-                        // ── 部分失败边界：父保存成功、周重置同步失败 → 不得报全部成功 ──
-                        let partialParent = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 20, height: 20),
-                                                     styleMask: [.titled], backing: .buffered, defer: false)
-                        let partialEditor = EditorSheetController(item: example, isNew: false)
-                        partialParent.beginSheet(partialEditor.window!)
-                        partialEditor.onSave = { _ in true }
-                        partialEditor.quotaResetSyncOverride = { _, enabled, _ in !enabled }   // 启用重置时模拟写失败
-                        partialEditor.perform(NSSelectorFromString("saveClicked"))
-                        precondition(!partialParent.isSheet, "部分失败时主条目已保存、表单关闭")
-                        precondition(EditorSheetController.lastSaveFailureMessage?.contains("未能更新") == true, "部分失败必须明确区分于全部成功")
-                        EditorSheetController.showsSaveFailureAlerts = true
-                        print("PASS: 部分失败边界明确（父成功+派生失败不报全部成功）")
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                            snapshot(editor.window!.contentView!, path: "build/render/editor.png")
-                            NSApp.terminate(nil)
+                    // 2) 收起态（贴边药丸）。先把最近条目推到「23时59分」（4 数字+3 汉字 > 42pt 可用宽）压测字号自适应
+                    var d1long = d1
+                    d1long.expiresAt = now.addingTimeInterval(3600 * 23 + 59 * 60)
+                    Store.shared.upsertManual(d1long)
+                    self.pc.debugSetExpanded(false)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        precondition(self.pc.debugPillFontSize < 9, "长倒计时应触发药丸字号自适应缩小")
+                        snapshot(self.pc.debugContentView!, path: "build/render/panel_pill.png")
+                        // 3) 设置后台
+                        let sc = SettingsWindowController(panel: self.pc)
+                        sc.showWindow(nil)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            sc.debugPrintGeometry()
+                            snapshot(sc.windowRef!.contentView!, path: "build/render/settings.png")
+                            self.behaviorTests(now: now)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                                NSApp.terminate(nil)
+                            }
                         }
                     }
                 }
-                }
             }
         }
+    }
+
+    /// 行为断言：智能保存管线（自动命名/伴生窗口/编辑平移/归档）+ 极简表单失败保留输入
+    private func behaviorTests(now: Date) {
+        // ── 智能管线：名称可识别、供应商留空 → 反向识别厂商 + 自动伴生重置窗口 ──
+        precondition(Store.shared.saveInferred(name: "Codex 额度", vendor: nil,
+                                               expiresAt: now.addingTimeInterval(5 * 3600),
+                                               purchaseAt: nil).saved)
+        let codexParent = Store.shared.manualItems
+            .first { $0.kind == .subscription && $0.name == "Codex 额度" }
+        precondition(codexParent != nil, "非空名称应原样保留")
+        precondition(codexParent?.vendor == "OpenAI", "名称含 Codex 应回收为 OpenAI")
+        let codexComp = Store.shared.manualItems
+            .first { $0.id == SubItem.quotaResetId(for: codexParent!.id) }
+        precondition(codexComp != nil && codexComp!.kind == .window,
+                     "已知名额厂商应自动生成重置伴生窗口")
+
+        // ── 未知厂商：不凭空造重置窗口 ──
+        precondition(Store.shared.saveInferred(name: "神秘年费", vendor: nil,
+                                               expiresAt: now.addingTimeInterval(365 * 86400),
+                                               purchaseAt: nil).saved)
+        let mystery = Store.shared.manualItems.first { $0.name.contains("神秘年费") }!
+        precondition(Store.shared.manualItems.first { $0.id == SubItem.quotaResetId(for: mystery.id) } == nil,
+                     "未知厂商不得凭空生成重置窗口")
+
+        // ── 编辑平移：改父条目到期 → 滚动伴生锚点同差值平移 ──
+        var edited = codexParent!
+        let oldExpiry = edited.expiresAt
+        edited.expiresAt = oldExpiry.addingTimeInterval(3600)
+        precondition(Store.shared.updateManual(edited, previousExpiry: oldExpiry).saved)
+        let movedComp = Store.shared.manualItems
+            .first { $0.id == SubItem.quotaResetId(for: edited.id) }!
+        precondition(abs(movedComp.expiresAt.timeIntervalSince(codexComp!.expiresAt.addingTimeInterval(3600))) < 1,
+                     "编辑到期应平移滚动伴生锚点")
+        print("PASS: 智能管线自动命名/伴生窗口/未知厂商不造窗口/编辑平移")
+
+        // ── 极简表单：保存失败保持打开、输入保留；成功正常关闭并走推断管线 ──
+        EditorSheetController.showsSaveFailureAlerts = false
+        let failParent = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 20, height: 20),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+        var draft = SubItem.manualDefault(name: "", vendor: "")
+        draft.expiresAt = now.addingTimeInterval(7 * 86400)
+        let failEditor = EditorSheetController(item: draft, isNew: true)
+        failParent.beginSheet(failEditor.window!)
+        let failName = descendants(failEditor.window!.contentView!)
+            .compactMap { $0 as? NSTextField }
+            .first { $0.placeholderString == "可选，留空自动命名" }!
+        failName.stringValue = "失败探针"
+        failEditor.onSave = { _, _, _ in false }
+        failEditor.perform(NSSelectorFromString("saveClicked"))
+        precondition(failEditor.window!.sheetParent != nil, "保存失败时表单必须保持打开")
+        precondition(failName.stringValue == "失败探针", "保存失败时输入必须原样保留")
+        precondition(EditorSheetController.lastSaveFailureMessage == "保存失败", "失败文案应可断言")
+        snapshot(failEditor.window!.contentView!, path: "build/render/editor.png")
+        failEditor.onSave = { item, previousExpiry, weeklyAnchor in
+            precondition(previousExpiry == nil, "新建路径 previousExpiry 应为 nil")
+            precondition(weeklyAnchor == nil, "周期窗口路径不应携带周拆分锚点")
+            if item.kind == .window {
+                return Store.shared.saveWindow(name: item.name, vendor: item.vendor,
+                                               expiresAt: item.expiresAt,
+                                               repeatHours: item.repeatHours ?? 168).saved
+            }
+            return Store.shared.saveInferred(name: item.name, vendor: item.vendor,
+                                             expiresAt: item.expiresAt, purchaseAt: nil).saved
+        }
+        // 选「周期额度 · 每周」（档位 2）→ 保存为 168h 滚动窗口（周额度界定 + 倒推窗口起点）
+        let typePopup = descendants(failEditor.window!.contentView!).compactMap { $0 as? NSPopUpButton }.first!
+        typePopup.selectItem(at: 2)
+        failEditor.perform(NSSelectorFromString("saveClicked"))
+        precondition(failEditor.window!.sheetParent == nil, "成功后表单正常关闭")
+        let weeklyFormEntry = Store.shared.manualItems.first { $0.name == "失败探针" && $0.kind == .window }
+        precondition(weeklyFormEntry?.repeatHours == 168 && weeklyFormEntry?.resetRule == .rolling,
+                     "表单选周期额度·每周 → 保存为 168h 滚动窗口")
+        precondition(weeklyFormEntry?.purchaseAt == weeklyFormEntry?.expiresAt.addingTimeInterval(-168 * 3600),
+                     "周期窗口保存时窗口起点倒推为 到期−周期")
+        EditorSheetController.showsSaveFailureAlerts = true
+        print("PASS: 极简表单失败保留输入、成功走推断管线关闭")
+        print("PASS: 类型档位选周额度 → 168h 滚动窗口 + 起点倒推")
+
+        // ── 「订阅 · 周额度重置」：官方节奏拆第k/n周组（显式输入首次重置 now+7 天）──
+        var grokDraft = SubItem.manualDefault(name: "Grok 月卡", vendor: "xAI")
+        grokDraft.expiresAt = now.addingTimeInterval(27 * 86400)
+        let splitEditor = EditorSheetController(item: grokDraft, isNew: true)
+        failParent.beginSheet(splitEditor.window!)
+        let splitPopup = descendants(splitEditor.window!.contentView!).compactMap { $0 as? NSPopUpButton }.first!
+        splitPopup.selectItem(at: 1)   // 订阅 · 周额度重置（第k/n周）
+        // 两个日期初值相同；按控件遍历顺序取第二个（首次重置）。
+        let datePickers = descendants(splitEditor.window!.contentView!).compactMap { $0 as? NSDatePicker }
+        precondition(datePickers.count == 2)
+        datePickers[1].dateValue = now.addingTimeInterval(7 * 86400)
+        splitEditor.onSave = { item, _, anchor in
+            precondition(anchor != nil, "周额度重置路径必须携带首次重置锚点")
+            precondition(item.kind == .subscription, "周额度重置主体是订阅而非窗口")
+            return Store.shared.saveWeeklySplit(name: item.name, vendor: item.vendor,
+                                                expiry: item.expiresAt, firstReset: anchor!).saved
+        }
+        splitEditor.perform(NSSelectorFromString("saveClicked"))
+        precondition(splitEditor.window!.sheetParent == nil, "拆分保存后表单正常关闭")
+        let splitMembers = Store.shared.manualItems
+            .filter { $0.name.hasPrefix("Grok 月卡·第") }
+            .sorted { $0.expiresAt < $1.expiresAt }
+        precondition(splitMembers.count == 3, "27 天订阅自 now+7 锚点应拆 3 轮（3×7=21≤27<28）")
+        precondition(splitMembers.first?.name == "Grok 月卡·第1/3周" && splitMembers.last?.name == "Grok 月卡·第3/3周",
+                     "第k/n周命名")
+        precondition(Set(splitMembers.compactMap(\.groupID)).count == 1, "拆分组成员共享 groupID")
+        precondition(splitMembers.last!.expiresAt < grokDraft.expiresAt, "末轮叠不满订阅到期")
+        print("PASS: 订阅周额度重置 → 第k/n周组（显式输入首次重置 now+7，末轮叠不满到期）")
+
+        var month31 = SubItem.manualDefault(name: "31天周期")
+        month31.kind = .window; month31.repeatHours = 744
+        let keepEditor = EditorSheetController(item: month31, isNew: false)
+        var kept: SubItem?
+        keepEditor.onSave = { item, _, _ in kept = item; return true }
+        keepEditor.perform(NSSelectorFromString("saveClicked"))
+        precondition(kept?.repeatHours == 744, "重新保存不能把31天周期改成30天")
+        pc.perform(NSSelectorFromString("hideClicked"))
+        for _ in 0..<31 { pc.tick() }
+        precondition(pc.debugContentView?.window?.isVisible == false, "用户隐藏不应被心跳重新拉起")
+        pc.showPanel()
+        precondition(pc.debugContentView?.layer?.filters?.isEmpty != false, "玻璃根容器不得挂模糊滤镜")
+        print("PASS: 31天周期保持、主动隐藏、玻璃根容器无滤镜")
+
+        // ── tooltip 语义：额度重置窗口称「重置/下次重置」，手动通用周期窗口仍称「到期」 ──
+        let qresetProbe = SubItem(id: "qreset:探针", name: "探针·周重置", vendor: "探针",
+                                  kind: .window, expiresAt: now.addingTimeInterval(3600),
+                                  repeatHours: 168, source: "manual", note: "",
+                                  usedPercent: nil, groupID: nil)
+        var manualWindow = SubItem.manualDefault(name: "月付续费日")
+        manualWindow.kind = .window
+        manualWindow.repeatHours = 720
+        precondition(RowView.detailTooltip(qresetProbe, now: now).contains("下次重置"), "周重置伴生窗口 tooltip 应称下次重置")
+        precondition(!RowView.detailTooltip(manualWindow, now: now).contains("下次重置"), "手动通用窗口 tooltip 不得称下次重置")
+        precondition(!RowView.detailTooltip(qresetProbe, now: now).contains("提醒"), "提醒功能已删除，tooltip 不得再出现提醒字样")
+        print("PASS: tooltip 按额度重置语义精确区分")
     }
 }
 
