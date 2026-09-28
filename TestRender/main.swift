@@ -239,6 +239,20 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// 渲染测试会写入演示记录；裸跑二进制时必须在接触 Store 前拒绝正式数据目录。
+let testEnvironment = ProcessInfo.processInfo.environment
+guard let isolatedRoot = testEnvironment["AR_DATA_DIR"], !isolatedRoot.isEmpty else {
+    fputs("TestRender 必须通过 test_render.sh 在隔离数据目录运行\n", stderr)
+    exit(2)
+}
+let testRoot = URL(fileURLWithPath: isolatedRoot, isDirectory: true).resolvingSymlinksInPath().standardizedFileURL
+let liveRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    .resolvingSymlinksInPath().standardizedFileURL
+guard testRoot != liveRoot else {
+    fputs("TestRender 不得使用正式数据目录\n", stderr)
+    exit(2)
+}
+
 let app = NSApplication.shared
 let d = TestDelegate()
 app.delegate = d
