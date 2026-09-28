@@ -8,10 +8,15 @@ import AppKit
 // - 手动打开的实例（无 --agent）在 install() 时 kickstart -k 把生命周期移交给 launchd，
 //   launchd 的新实例通过「新实例接管」终止旧实例，最终收敛为 launchd 持有的单实例
 // - 被强杀/崩溃 → launchd 立即重启；菜单「退出」也会被立即重启（真常驻）
-// - 彻底关闭：设置里关闭常驻（bootout + 删除 plist），应用会以「不受守护」模式重启一次
+// - 彻底关闭：独立 helper 注销 job 并重开普通实例；关闭偏好在以后手动启动时继续生效
 
 enum Resident {
     static let label = "com.sijunting.ai-expiry-reminder"
+    private static let disabledKey = "residentDisabled"
+
+    static var isEnabledByUser: Bool {
+        !UserDefaults.standard.bool(forKey: disabledKey)
+    }
 
     static var isAgentSpawn: Bool {
         CommandLine.arguments.contains("--agent")
@@ -92,12 +97,13 @@ enum Resident {
         return true
     }
 
-    /// 关闭常驻：以「不受守护」模式重启应用，由新实例移除 LaunchAgent
-    static func uninstallViaDetach() {
+    /// launchd 会结束自己的 job 进程，因此由独立 helper 完成注销和普通实例重启。
+    @discardableResult
+    static func uninstallViaDetach() -> Bool {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = [appPath, "--args", "--no-agent"]
-        try? p.run()
+        p.executableURL = URL(fileURLWithPath: binaryPath)
+        p.arguments = ["--disable-resident-helper"]
+        do { try p.run(); return true } catch { return false }
     }
 
     @discardableResult
@@ -120,19 +126,46 @@ enum Resident {
     /// 常驻开关。关闭时当前实例（若是 job 进程）会被接管流程替换。
     @discardableResult
     static func toggle() -> Bool {
-        if isInstalled() {
-            uninstallViaDetach()
+        if isInstalled() || isLoaded() {
+            UserDefaults.standard.set(true, forKey: disabledKey)
+            Store.shared.state.launchAtLogin = false
+            Store.shared.save()
+            guard uninstallViaDetach() else {
+                UserDefaults.standard.set(false, forKey: disabledKey)
+                Store.shared.state.launchAtLogin = true
+                Store.shared.save()
+                return true
+            }
             return false
         }
-        return install()
+        UserDefaults.standard.set(false, forKey: disabledKey)
+        guard install() else {
+            UserDefaults.standard.set(true, forKey: disabledKey)
+            return false
+        }
+        return true
     }
 
-    // MARK: --no-agent 实例的清理
+    // MARK: helper 清理
     @discardableResult
     static func disableNow() -> Bool {
-        bootout()
         try? FileManager.default.removeItem(at: plistURL)
-        return !isInstalled()
+        let stopped = bootout()
+        return stopped && !isInstalled() && !isLoaded()
+    }
+
+    /// helper 进程不参与单实例接管，避免在 bootout 前杀死被 launchd 托管的实例。
+    static func runDisableHelper() {
+        guard disableNow() else {
+            UserDefaults.standard.set(false, forKey: disabledKey)
+            Store.shared.state.launchAtLogin = true
+            Store.shared.save()
+            _ = install()
+            return
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: binaryPath)
+        do { try p.run() } catch { NSLog("AR: 关闭常驻后重启失败：\(error)") }
     }
 
     // MARK: 单实例（新实例接管）

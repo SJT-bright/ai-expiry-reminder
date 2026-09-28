@@ -8,10 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 常驻：接管单实例 + 确保 LaunchAgent（登录自启 + 被杀/退出后自动重启）
         Resident.acquireSingleInstance()
-        if CommandLine.arguments.contains("--no-agent") {
-            // 关闭常驻时以脱离模式重启的实例：移除 LaunchAgent 后不受守护运行
-            Resident.disableNow()
-        } else {
+        if Resident.isEnabledByUser {
             Resident.install()
         }
 
@@ -36,6 +33,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         Resident.releaseSingleInstance()
     }
+}
+
+if CommandLine.arguments.contains("--disable-resident-helper") {
+    Resident.runDisableHelper()
+    exit(0)
 }
 
 let app = NSApplication.shared
