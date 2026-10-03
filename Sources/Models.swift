@@ -48,6 +48,19 @@ struct SubItem: Codable, Equatable {
     /// 是否已归档（过期后自动/手动归档；归档条目在列表沉底，超过保留期后清除）
     var isArchived: Bool { archivedAt != nil }
 
+    /// 本轮到期后能否再滚出一轮；nil = 滚不动（非窗口 / 已归档 / repeatHours 与日历参数无效）。
+    /// 「能不能滚」只有一个判据：nextRollInstant、rollManualWindows、「清理过期」三处共用，
+    /// 否则清理会删掉自动流程还准备往前滚的活窗口（数据丢失）。
+    func nextRoll(after now: Date) -> Date? {
+        guard kind == .window, archivedAt == nil else { return nil }
+        switch resetRule {
+        case .calendarMonth, .calendarWeek, .anchorMonth:
+            return nextCalendarReset(after: now)
+        default:
+            return SubItem.nextRollingReset(anchor: expiresAt, hours: repeatHours ?? 0, now: now)
+        }
+    }
+
     /// 周期重置伴生窗口的确定性 id：跟随父订阅，编辑时反查、保存时幂等更新
     static func quotaResetId(for parentID: String) -> String { "qreset:" + parentID }
 
@@ -393,8 +406,9 @@ struct AutoCollapseSuppressor: Equatable {
 /// 旧 state.json 里已删除的 key（如 notifiedKeys/feishuWebhook）由合成 Codable 自动忽略。
 struct AppState: Codable {
     var panelCollapsed: Bool = true
-    var launchAtLogin: Bool = false
     var dismissedAuto: [String] = []   // 被用户隐藏的官方条目 id（⟳ 刷新可恢复）
+    /// 首次启动引导已给过（空库自动展开一次）；nil = 旧版本状态文件，首次 showPanel 时置位
+    var autoExpandDone: Bool?
 }
 
 /// 手动条目写入结果：区分「完全失败」「已保存但关联同步失败」「全部成功」
@@ -422,6 +436,8 @@ final class Store {
     let dir: URL
     private let settingsFileURL: URL
     private let queue = DispatchQueue(label: "store.io")
+    // 迁移未完整完成时，后续设置保存也必须保留旧记录，不能旁路删除。
+    private var pendingLegacyManualItems: Any?
 
     /// 设置
     var state = AppState()
@@ -457,30 +473,72 @@ final class Store {
     /// 旧版 state.json 里的 manualItems 迁移进数据库（一次性，幂等）
     private func migrateLegacyManualItems() {
         guard let data = try? Data(contentsOf: settingsFileURL),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let legacy = obj["manualItems"] as? [[String: Any]], !legacy.isEmpty else { return }
-        let dec = JSONDecoder()
-        dec.dateDecodingStrategy = .iso8601
-        var imported = 0
-        for row in legacy {
-            guard let d = try? JSONSerialization.data(withJSONObject: row),
-                  var item = try? dec.decode(SubItem.self, from: d) else { continue }
-            if item.id.hasPrefix("demo:") { continue }   // 测试数据不入库
-            if db.upsert(item, action: "import") { imported += 1 }
+              var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawLegacy = object["manualItems"] else { return }
+        pendingLegacyManualItems = rawLegacy
+        guard let legacy = rawLegacy as? [[String: Any]] else {
+            NSLog("AR: 旧记录结构无效，保留原始数据，未迁移")
+            return
         }
-        NSLog("AR: 已迁移 \(imported) 条旧记录到 SQLite")
-        save()   // 重写 state.json，去掉 manualItems 键
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var items: [SubItem] = []
+        var seenIDs = Set<String>()
+        for row in legacy {
+            guard let bytes = try? JSONSerialization.data(withJSONObject: row),
+                  let item = try? decoder.decode(SubItem.self, from: bytes),
+                  !item.id.isEmpty, seenIDs.insert(item.id).inserted else {
+                NSLog("AR: 旧记录无法完整校验，保留原始数据，未迁移")
+                return
+            }
+            if !item.id.hasPrefix("demo:") { items.append(item) }
+        }
+        do {
+            // 原始文件留底，包括未知旧字段；不能先删除manualItems再提交数据库。
+            let backup = dir.appendingPathComponent("state.json.legacy-\(UUID().uuidString).bak")
+            try data.write(to: backup, options: .atomic)
+        } catch {
+            NSLog("AR: 旧记录备份失败，保留原文件，未迁移")
+            return
+        }
+        let migrated = db.transaction {
+            // 数据库提交后JSON清理失败的重试，不覆盖后来修改过的同ID条目。
+            let existingIDs = Set(db.loadItems().map { $0.id })
+            for item in items where !existingIDs.contains(item.id) {
+                if !db.upsert(item, action: "import") { return false }
+            }
+            let persistedIDs = Set(db.loadItems().map { $0.id })
+            return items.allSatisfy { persistedIDs.contains($0.id) }
+        }
+        guard migrated else {
+            NSLog("AR: 旧记录事务迁移失败，保留原始数据供重试")
+            return
+        }
+        object.removeValue(forKey: "manualItems")
+        do {
+            let cleaned = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+            try cleaned.write(to: settingsFileURL, options: .atomic)
+            pendingLegacyManualItems = nil
+            NSLog("AR: 已完整迁移 \(items.count) 条旧记录到 SQLite")
+        } catch {
+            NSLog("AR: 迁移已入库但旧JSON清理失败，保留原始记录供幂等重试")
+        }
     }
 
     /// 保存设置（记录类数据在数据库，不经此路径）。写盘结果经 onSettingsWriteResult（主线程）反馈
     func save() {
-        queue.async { [weak self, state, settingsFileURL] in
+        queue.async { [weak self, state, settingsFileURL, pendingLegacyManualItems] in
             let enc = JSONEncoder()
             enc.dateEncodingStrategy = .iso8601
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
             var ok = false
-            if let data = try? enc.encode(state) {
+            if var data = try? enc.encode(state) {
                 do {
+                    if let pendingLegacyManualItems,
+                       var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        object["manualItems"] = pendingLegacyManualItems
+                        data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+                    }
                     try data.write(to: settingsFileURL, options: .atomic)
                     ok = true
                 } catch {
@@ -759,15 +817,7 @@ final class Store {
     /// 只统计真正能滚动的窗口：归档窗口不再驱动滚动；卡死窗口（repeatHours 无效、
     /// 日历参数算不出下一节点）排除——否则 deadline 永远停在过去，roll 分支每秒空转。
     func nextRollInstant(now: Date = Date()) -> Date? {
-        manualItems.filter { item in
-            guard item.kind == .window, item.archivedAt == nil else { return false }
-            switch item.resetRule {
-            case .calendarMonth, .calendarWeek, .anchorMonth:
-                return item.nextCalendarReset(after: now) != nil
-            default:
-                return SubItem.nextRollingReset(anchor: item.expiresAt, hours: item.repeatHours ?? 0, now: now) != nil
-            }
-        }.map(\.expiresAt).min()
+        manualItems.filter { $0.nextRoll(after: now) != nil }.map(\.expiresAt).min()
     }
 
     /// 同供应商最近一条带重置模型的手动窗口（按 updatedAt 降序，vendor 大小写不敏感）
@@ -826,10 +876,21 @@ final class Store {
         return n
     }
 
-    /// 过期超过 24 小时的手动条目
-    func expiredManualItems(olderThan hours: Double = 24) -> [SubItem] {
-        let cutoff = Date().addingTimeInterval(-hours * 3600)
-        return manualItems.filter { $0.expiresAt < cutoff }
+    /// 过期处置阈值（天）：过期满 3 天才算「这条死了」。归档与「清理过期」共用同一常量——
+    /// 两边阈值不一致，就会出现「手删得掉、自动流程还打算往前滚」的口径裂缝。
+    static let archiveAfterDays: Double = 3
+
+    /// 「清理过期」候选：过期满归档阈值(3天) + 未归档 + 不是还能往前滚的活窗口。
+    /// 原实现只看 `expiresAt < now-24h`，既不看 archivedAt 也不看 kind，等于把
+    /// ① 刚过期一天、按策略还该留两天的条目，② 用户仍在消耗的 .window 额度周期
+    /// 一起删掉（数据丢失）。归档条目走 purgeArchived（30 天）或设置后台逐条删除，不在此重复。
+    /// 官方来源条目不清理（与 archiveExpiredSubscriptions 的 source 判定一致）。
+    func expiredManualItems(olderThan days: Double = Store.archiveAfterDays, now: Date = Date()) -> [SubItem] {
+        let cutoff = now.addingTimeInterval(-days * 86400)
+        return manualItems.filter { item in
+            guard item.source == "manual", item.archivedAt == nil, item.expiresAt < cutoff else { return false }
+            return item.nextRoll(after: now) == nil   // 滚得动的窗口 = 活额度，删不得
+        }
     }
 
     @discardableResult
@@ -847,17 +908,8 @@ final class Store {
     func rollManualWindows(now: Date = Date()) {
         var rolled = false
         for i in manualItems.indices {
-            guard manualItems[i].kind == .window, !manualItems[i].isArchived,
-                  manualItems[i].expiresAt <= now else { continue }
-            let next: Date?
-            switch manualItems[i].resetRule {
-            case .calendarMonth, .calendarWeek, .anchorMonth:
-                next = manualItems[i].nextCalendarReset(after: now)
-            default:
-                next = SubItem.nextRollingReset(anchor: manualItems[i].expiresAt,
-                                               hours: manualItems[i].repeatHours ?? 0, now: now)
-            }
-            guard let next else { continue }
+            guard manualItems[i].expiresAt <= now,
+                  let next = manualItems[i].nextRoll(after: now) else { continue }
             var updated = manualItems[i]
             updated.expiresAt = next
             if write(updated, action: "roll") {
@@ -870,7 +922,8 @@ final class Store {
 
     /// 生命周期：手动订阅过期超过 days 天且未归档 → 打上归档时间（面板隐藏，保留期内可清理）。
     /// 伴生重置窗口随父一并归档——订阅已死，「下次重置」不再有意义，否则成孤儿窗口常驻面板。
-    func archiveExpiredSubscriptions(olderThan days: Double = 3, now: Date = Date()) {
+    /// days 缺省即「清理过期」的阈值：条目先被归档、之后只能逐条删或等 purgeArchived，两者不会互相抢活。
+    func archiveExpiredSubscriptions(olderThan days: Double = Store.archiveAfterDays, now: Date = Date()) {
         let cutoff = now.addingTimeInterval(-days * 86400)
         for i in manualItems.indices {
             let it = manualItems[i]

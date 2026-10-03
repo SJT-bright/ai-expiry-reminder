@@ -1,6 +1,5 @@
 import AppKit
 import QuartzCore
-import CoreImage
 
 // MARK: - 悬停浮起按钮
 // 鼠标移入：轻微放大浮起 + 高亮；移出：落下还原。全局统一交互语言。
@@ -8,7 +7,19 @@ import CoreImage
 class HoverEffectButton: NSButton {
     /// 悬停放大档：1.12 + 更亮的高亮层——「触感更强」的手感基准，全局按钮统一
     var hoverScale: CGFloat = 1.12
+    /// 芯片按钮内边距：isBordered=false 的固有尺寸默认只有文字大小，加上它才有可点的面
+    var contentPadding = NSEdgeInsets() {
+        didSet { invalidateIntrinsicContentSize() }
+    }
     private var tracking: NSTrackingArea?
+
+    override var intrinsicContentSize: NSSize {
+        let s = super.intrinsicContentSize
+        let p = contentPadding
+        guard p.top != 0 || p.left != 0 || p.bottom != 0 || p.right != 0 else { return s }
+        return NSSize(width: s.width + p.left + p.right,
+                      height: max(s.height + p.top + p.bottom, 20))
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -32,8 +43,11 @@ class HoverEffectButton: NSButton {
     }
 }
 
-// MARK: - 虚化渐入动效（blur-in reveal）
-// 规格：A 档——0.35s 入场过渡，透明度 0.55→1 + 高斯模糊 6px→0，ease-out，无位移无缩放。
+// MARK: - 渐入动效（fade-in reveal）
+// 规格：0.35s 入场，透明度 0.55→1，ease-out，无位移无缩放。
+// 早先这里还挂一层 CIGaussianBlur 6px→0 的"虚化渐入"，那是磨砂时代的补票动作：
+// 现在根容器是系统液态玻璃，再叠一层 Core Image 模糊等于每开一次就把玻璃糊成磨砂，
+// 且滤镜挂在 contentView.layer 上会污染后续合成，故整条模糊链路删除，只留透明度。
 // 遵循系统「减弱动态效果」；TestRender 置 enabled=false 保证截图与断言同步。
 
 enum Motion {
@@ -42,38 +56,66 @@ enum Motion {
     /// 动效时长常量（集中调参）：A 档
     static let revealDuration: TimeInterval = 0.35
     static let startAlpha: CGFloat = 0.55
-    static let startBlur: Double = 6.0
 
     private static var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
-    /// 虚化渐入（窗口）：透明度 + 高斯模糊过渡（几何不动）
+    /// 渐入（窗口）：只走透明度，几何与滤镜都不碰
     static func reveal(_ window: NSWindow, duration: TimeInterval = revealDuration) {
         guard enabled, !reduceMotion else { return }
         window.alphaValue = startAlpha
-        armBlur(window.contentView, duration: duration)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = duration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             window.animator().alphaValue = 1.0
-        }, completionHandler: {
-            window.contentView?.layer?.filters = nil
         })
     }
 
-    /// 虚化渐入（视图）：透明度 + 高斯模糊过渡（视图几何不动）
+    /// 渐入（视图）：只走透明度
     static func reveal(_ view: NSView, duration: TimeInterval = revealDuration) {
         guard enabled, !reduceMotion else { return }
         view.alphaValue = startAlpha
-        armBlur(view, duration: duration)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = duration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             view.animator().alphaValue = 1.0
-        }, completionHandler: {
-            view.layer?.filters = nil
         })
+    }
+
+    /// 编辑卡在自己的最终位置向屏幕前浮出：轻微放大并淡入，没有垂直位移。
+    /// 只动画新卡的呈现层；模型层保持最终状态，重复点击不会把整列重播。
+    static func popForward(_ view: NSView) {
+        guard enabled, !reduceMotion else { return }
+        view.wantsLayer = true
+        guard let layer = view.layer else { return }
+        let duration: TimeInterval = 0.22
+        let startScale: CGFloat = 0.96
+        let timing = CAMediaTimingFunction(name: .easeOut)
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = startScale
+        scale.toValue = 1.0
+        scale.duration = duration
+        scale.timingFunction = timing
+        let x = CABasicAnimation(keyPath: "transform.translation.x")
+        x.fromValue = layer.bounds.width * (1 - startScale) / 2
+        x.toValue = 0
+        x.duration = duration
+        x.timingFunction = timing
+        let y = CABasicAnimation(keyPath: "transform.translation.y")
+        y.fromValue = layer.bounds.height * (1 - startScale) / 2
+        y.toValue = 0
+        y.duration = duration
+        y.timingFunction = timing
+        let opacity = CABasicAnimation(keyPath: "opacity")
+        opacity.fromValue = 0.65
+        opacity.toValue = 1.0
+        opacity.duration = duration
+        opacity.timingFunction = timing
+        layer.add(scale, forKey: "popForward.scale")
+        layer.add(x, forKey: "popForward.x")
+        layer.add(y, forKey: "popForward.y")
+        layer.add(opacity, forKey: "popForward.opacity")
     }
 
     /// 轻量淡入（无模糊，适合行级小元素）；delay>0 时先隐藏再延迟入场
@@ -166,23 +208,5 @@ enum Motion {
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
         layer.backgroundColor = on ? color.cgColor : NSColor.clear.cgColor
         CATransaction.commit()
-    }
-
-    /// 挂载高斯模糊滤镜并播放半径衰减动画
-    private static func armBlur(_ view: NSView?, duration: TimeInterval) {
-        guard enabled, !reduceMotion, let view else { return }
-        view.wantsLayer = true
-        view.layerUsesCoreImageFilters = true
-        guard let layer = view.layer, let blur = CIFilter(name: "CIGaussianBlur") else { return }
-        blur.setValue(startBlur, forKey: kCIInputRadiusKey)
-        layer.filters = [blur]
-        let anim = CABasicAnimation(keyPath: "filters.gaussianBlur.inputRadius")
-        anim.fromValue = startBlur
-        anim.toValue = 0.0
-        anim.duration = duration
-        anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        anim.fillMode = .forwards
-        anim.isRemovedOnCompletion = false
-        layer.add(anim, forKey: "motionBlurIn")
     }
 }

@@ -64,9 +64,31 @@ var liveParent = SubItem.manualDefault(name: "在期订阅")
 liveParent.expiresAt = Date().addingTimeInterval(60 * 86400)
 store.upsertManual(liveParent)
 store.upsertManual(makeCompanion(liveParent, at: Date().addingTimeInterval(7 * 86400)))
-let expiredIDs = store.expiredManualItems(olderThan: 24).map { $0.id }
+// olderThan 的单位是「天」，与自动归档同阈值（Store.archiveAfterDays）：
+// 早先这里按小时传 24，改名后会被静默读成 24 天，测试意图就没了。默认参数即策略本体。
+let expiredIDs = store.expiredManualItems().map { $0.id }
 expect(expiredIDs.contains(deadParent.id), "过期父订阅进入清理名单")
 expect(!expiredIDs.contains(liveParent.id), "在期订阅不进入清理名单")
+
+// 清理名单的三条排除：刚过期未达阈值、已归档、仍在滚动的额度窗口——曾经全漏，会误删
+var justExpired = SubItem.manualDefault(name: "刚过期29小时")
+justExpired.expiresAt = Date().addingTimeInterval(-29 * 3600)
+store.upsertManual(justExpired)
+var archived = SubItem.manualDefault(name: "已归档过期")
+archived.expiresAt = Date().addingTimeInterval(-10 * 86400)
+archived.archivedAt = Date().addingTimeInterval(-1 * 86400)
+store.upsertManual(archived)
+var liveWindow = SubItem.manualDefault(name: "滚动窗口在期")
+liveWindow.expiresAt = Date().addingTimeInterval(-3600)          // 窗口刚走完一轮
+liveWindow.kind = .window
+liveWindow.repeatHours = 24
+store.upsertManual(liveWindow)
+let after = store.expiredManualItems().map { $0.id }
+expect(!after.contains(justExpired.id), "过期未达 3 天不进清理名单")
+expect(!after.contains(archived.id), "已归档条目不进清理名单（走归档清理，不是这里）")
+expect(!after.contains(liveWindow.id), "仍在滚动的额度窗口不进清理名单")
+expect(!after.contains(liveParent.id), "补种后在期订阅仍不进名单")
+
 store.deleteManualsWithDerived(expiredIDs)
 expect(store.manualItems.first { $0.id == deadParent.id } == nil, "批量清理移除过期父订阅")
 expect(store.manualItems.first { $0.id == "qreset:" + deadParent.id } == nil, "批量清理连带移除其周重置窗口")
@@ -513,7 +535,14 @@ expect(store.manualItems.first { $0.id == oldSub.id }?.isArchived == true, "过�
 expect(store.manualItems.first { $0.id == "qreset:" + oldSub.id }?.isArchived == true, "伴生重置窗口随父一并归档，不留孤儿窗口")
 expect(store.manualItems.first { $0.id == freshSub.id }?.isArchived == false, "在期订阅不受归档影响")
 let sorted = SubItem.displaySorted(store.manualItems, now: Date())
-expect(sorted.last?.id == oldSub.id, "displaySorted：归档条目沉底")
+// 归档沉底用结构化断言而非「末位==oldSub」：本测试前序小节留下的过期条目会随真实时间
+// 漂移陆续被归档（比 oldSub 更早过期的会排在最后），逐字比较会随日期漂移假失败。
+let firstArchivedIdx = sorted.firstIndex { $0.isArchived } ?? sorted.count
+expect(sorted[firstArchivedIdx...].contains { $0.id == oldSub.id },
+       "displaySorted：oldSub 位于归档块内")
+expect(sorted[..<firstArchivedIdx].allSatisfy { !$0.isArchived },
+       "displaySorted：归档条目沉底（归档块连续且只在尾部）")
+expect(sorted.last?.isArchived == true, "displaySorted：末位是归档条目")
 expect(sorted.first?.isArchived == false, "displaySorted：未归档在前")
 let liveSorted = sorted.filter { !$0.isArchived }
 expect(zip(liveSorted, liveSorted.dropFirst()).allSatisfy { $0.expiresAt <= $1.expiresAt }, "displaySorted：未归档按到期升序")

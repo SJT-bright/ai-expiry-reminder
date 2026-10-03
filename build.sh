@@ -28,21 +28,23 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>AIReminder</string>
     <key>CFBundleDisplayName</key><string>$APP_NAME</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-    <key>CFBundleVersion</key><string>1.0</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1.1.0</string>
+    <key>CFBundleShortVersionString</key><string>1.1.0</string>
     <key>CFBundleExecutable</key><string>AIReminder</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSUIElement</key><true/>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>NSHumanReadableCopyright</key><string>Personal tool</string>
 </dict>
 </plist>
 PLIST
 
 echo "==> swiftc 编译中…"
-swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" -module-cache-path "$BUILD_DIR/module-cache" \
-    Sources/Models.swift Sources/Database.swift Sources/Readers.swift Sources/Motion.swift Sources/Vendors.swift Sources/PanelUI.swift Sources/Settings.swift Sources/Resident.swift Sources/main.swift \
+# 系统液态玻璃（NSGlassEffectView / NSBezelStyleGlass）是 macOS 26 的公开 API，
+# 编译下限就定在 26.0，不再保留磨砂玻璃退路。
+swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos26.0" -module-cache-path "$BUILD_DIR/module-cache" \
+    Sources/Models.swift Sources/Database.swift Sources/Readers.swift Sources/Motion.swift Sources/Vendors.swift Sources/CalendarPicker.swift Sources/PanelUI.swift Sources/Settings.swift Sources/Resident.swift Sources/main.swift \
     -o "$APP/Contents/MacOS/AIReminder"
 
 codesign --force --deep --sign - "$APP" 2>/dev/null || true

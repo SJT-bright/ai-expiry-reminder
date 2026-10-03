@@ -45,6 +45,7 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
     private let writeWarnLabel = NSTextField(labelWithString: "")
     private weak var panel: PanelController?
     private var reloadTimer: Timer?
+    private var refreshPoll: Timer?
     private var hoveredRowView: NSTableRowView?
 
     init(panel: PanelController) {
@@ -164,9 +165,10 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         bottom.spacing = 6
         bottom.translatesAutoresizingMaskIntoConstraints = false
 
-        // ---- 玻璃底材 + 顶部标题 ----
-        let glass = NSVisualEffectView()
-        Glass.apply(glass, corner: 0)
+        // ---- 玻璃底板 + 顶部标题 ----
+        // 满幅贴窗：圆角由标题窗自己裁，这里给 0；给正值反而会从窗口圆角里缩进一圈。
+        // 底板吃 bodyTint（行片不吃），白字在浅色壁纸上才稳得住。
+        let glass = Glass.make(cornerRadius: 0, tint: Glass.bodyTint)
         glass.translatesAutoresizingMaskIntoConstraints = false
 
         let titleLabel = NSTextField(labelWithString: "⏳ AI到期提醒 · 设置后台")
@@ -211,6 +213,10 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         window.center()
         window.makeKeyAndOrderFront(sender)
         Motion.reveal(window)
+        // 常驻态可能被面板右键菜单（或外部 launchctl）改过，buildWindow 时读的那一次早就失效
+        launchCheckbox.state = Resident.isInstalled() ? .on : .off
+        // 打开即重取一次数据：窗口隐藏期间 softReload 只更新数组不刷新表格，行序可能停在上次关闭时
+        reloadFromStore()
         // 打开时按最近一次写盘结果同步警示行
         if let ok = Store.shared.lastSettingsWriteOK {
             updateWriteWarnLabel(ok: ok)
@@ -247,20 +253,28 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
 
     // MARK: 数据
 
+    /// 与面板同一口径的排序（SubItem.displaySorted）：归档/长期过期的沉到底。
+    /// snapshotItems 是纯到期升序，过期几年的垃圾会顶在表头，真正临近的订阅被挤下去。
+    private func sortedRows() -> [SubItem] {
+        SubItem.displaySorted(panel?.snapshotItems() ?? [])
+    }
+
     private func reloadFromStore() {
-        items = panel?.snapshotItems() ?? []
+        items = sortedRows()
         table.reloadData()
         updateButtonStates()
     }
 
     /// 每秒轻量刷新：更新倒计时列 + 同步官方数据变化
     private func softReload() {
-        items = panel?.snapshotItems() ?? []
+        // 重排后行号会变，选中项必须按 id 复位：按行号复位会把编辑/删除按钮指到别的条目上
+        let sel = table.selectedRow
+        let selID = (sel >= 0 && sel < items.count) ? items[sel].id : nil
+        items = sortedRows()
         guard window.isVisible, table.window != nil else { return }
-        let selected = table.selectedRow
         table.reloadData()
-        if selected >= 0 && selected < items.count {
-            table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
+        if let selID, let row = items.firstIndex(where: { $0.id == selID }) {
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
         updateButtonStates()
     }
@@ -367,37 +381,63 @@ final class SettingsWindowController: NSObject, NSTableViewDataSource, NSTableVi
         refreshBtn.isEnabled = false
         refreshBtn.title = "刷新中…"
         panel?.refreshData()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            guard let self else { return }
-            self.reloadFromStore()
-            self.refreshBtn.title = "✓ 已刷新"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self] in
-                self?.refreshBtn.title = "刷新官方"
-                self?.refreshBtn.isEnabled = true
+        watchRefreshFinish()
+    }
+
+    /// 以「面板自己的 ⟳ 恢复可用」为刷新完成判据。
+    /// 写死 +1.2s 会在读者还没跑完时就报「✓ 已刷新」，用户以为拿到了新数据其实没有。
+    /// PanelController 的 refreshing 是 private 且没有完成回调，这是设置侧唯一能观察到的真实信号。
+    private func watchRefreshFinish() {
+        refreshPoll?.invalidate()
+        let started = Date()
+        var sawRunning = false
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            let running = self.panel.map { $0.debugRefreshIndicatorOn } ?? false
+            if running { sawRunning = true }
+            // 没观察到过「刷新中」时至少等半秒再收，避免面板尚未置位就误判成已完成
+            if !running, sawRunning || Date().timeIntervalSince(started) > 0.5 {
+                t.invalidate()
+                self.refreshPoll = nil
+                self.reloadFromStore()
+                self.refreshBtn.title = "✓ 已刷新"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self] in
+                    self?.refreshBtn.title = "刷新官方"
+                    self?.refreshBtn.isEnabled = true
+                }
+                return
+            }
+            if Date().timeIntervalSince(started) > 60 {   // 读者遍历磁盘可能很久：真超时才放手，但不能永久按死
+                t.invalidate()
+                self.refreshPoll = nil
+                self.refreshBtn.title = "刷新官方"
+                self.refreshBtn.isEnabled = true
+                NSLog("AR: 设置后台等待刷新完成超时，按未完成处理")
             }
         }
+        refreshPoll = timer
+        RunLoop.main.add(timer, forMode: .common)   // 模态弹窗/滚动期间也要继续轮询
     }
 
     @objc private func toggleLaunch() {
         let nowOn = Resident.toggle()
-        Store.shared.state.launchAtLogin = nowOn
-        Store.shared.save()
         launchCheckbox.state = nowOn ? .on : .off
     }
 
-    /// 删除过期超过 24 小时的手动条目（官方数据不清理）
+    /// 删除过期超过归档阈值（3 天，与自动归档同口径）的手动条目：
+    /// 官方数据、已归档条目、仍在滚动的额度窗口都不在名单内
     @objc private func cleanExpired() {
         let expired = Store.shared.expiredManualItems()
         guard !expired.isEmpty else {
             let alert = NSAlert()
             alert.messageText = "没有需要清理的条目"
-            alert.informativeText = "过期超过 24 小时的手动条目会被清理。"
+            alert.informativeText = "没有过期超过 3 天的手动条目需要清理。"
             alert.runModal()
             return
         }
         let alert = NSAlert()
         alert.messageText = "清理 \(expired.count) 条已过期条目？"
-        alert.informativeText = "将删除过期超过 24 小时的手动记录：\n"
+        alert.informativeText = "将删除过期超过 3 天的手动记录（已归档条目与仍在滚动的额度窗口不在此列）：\n"
             + expired.prefix(5).map { "· \($0.name)" }.joined(separator: "\n")
             + (expired.count > 5 ? "\n…" : "")
         alert.addButton(withTitle: "取消")           // 回车默认 = 取消，防误清

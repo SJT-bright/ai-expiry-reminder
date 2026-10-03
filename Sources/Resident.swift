@@ -128,12 +128,8 @@ enum Resident {
     static func toggle() -> Bool {
         if isInstalled() || isLoaded() {
             UserDefaults.standard.set(true, forKey: disabledKey)
-            Store.shared.state.launchAtLogin = false
-            Store.shared.save()
             guard uninstallViaDetach() else {
                 UserDefaults.standard.set(false, forKey: disabledKey)
-                Store.shared.state.launchAtLogin = true
-                Store.shared.save()
                 return true
             }
             return false
@@ -158,8 +154,6 @@ enum Resident {
     static func runDisableHelper() {
         guard disableNow() else {
             UserDefaults.standard.set(false, forKey: disabledKey)
-            Store.shared.state.launchAtLogin = true
-            Store.shared.save()
             _ = install()
             return
         }
