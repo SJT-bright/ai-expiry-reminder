@@ -1417,8 +1417,8 @@ final class EditorSheetController: NSWindowController {
 final class PanelController: NSObject, NSMenuDelegate {
     private enum Metrics {
         static let expandedWidth: CGFloat = 240
-        static let pillWidth: CGFloat = 112
-        static let pillHeight: CGFloat = 30
+        static let pillWidth: CGFloat = 54
+        static let pillHeight: CGFloat = 18
         static let dockMargin: CGFloat = 6
         static let headerH: CGFloat = 16
         static let rowH: CGFloat = 28
@@ -1427,7 +1427,8 @@ final class PanelController: NSObject, NSMenuDelegate {
         static let padSide: CGFloat = 8
         static let padTop: CGFloat = 5
         static let padBottom: CGFloat = 5
-        static let pillFontSize: CGFloat = 11
+        static let pillFontSize: CGFloat = 9
+        static let pillMinFontSize: CGFloat = 6.5
         /// 展开面板高度封顶：内容再长也只占可视区，行区转入滚动
         static let minViewportH: CGFloat = 180
         static let screenMargin: CGFloat = 8
@@ -1443,8 +1444,6 @@ final class PanelController: NSObject, NSMenuDelegate {
     private let rowsContainer = NSView()
     private let scrollIndicator = NSView()
     private let pillLabel = NSTextField(labelWithString: "")
-    private let pillDot = NSView()
-    private let pillChevron = NSImageView()
     private let pillHoverOutline = PillHoverOutline()
     private let headerView = NSStackView()
 
@@ -1563,17 +1562,11 @@ final class PanelController: NSObject, NSMenuDelegate {
 
         pillLabel.font = .monospacedDigitSystemFont(ofSize: Metrics.pillFontSize, weight: .semibold)
         pillLabel.alignment = .center
-        pillLabel.lineBreakMode = .byTruncatingTail
+        pillLabel.lineBreakMode = .byClipping
         pillLabel.maximumNumberOfLines = 1
         pillLabel.textColor = .white
         pillLabel.setAccessibilityIdentifier("capsuleCountdown")
-        pillDot.wantsLayer = true
-        pillDot.layer?.cornerRadius = 3
-        pillChevron.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "展开")
-        pillChevron.contentTintColor = NSColor(white: 1, alpha: 0.75)
-        pillChevron.imageScaling = .scaleProportionallyDown
-        pillDot.setAccessibilityElement(false)
-        pillChevron.setAccessibilityElement(false)
+
 
         container = PanelContainerView()
         container.addSubview(headerView)
@@ -1587,9 +1580,7 @@ final class PanelController: NSObject, NSMenuDelegate {
         rowsClip.addSubview(scrollIndicator)
         rowsClip.onScroll = { [weak self] dy in self?.applyScroll(deltaY: dy) }
         container.addSubview(rowsClip)
-        container.addSubview(pillDot)
         container.addSubview(pillLabel)
-        container.addSubview(pillChevron)
         pillHoverOutline.alphaValue = 0
         container.addSubview(pillHoverOutline)
         container.autoresizingMask = [.width, .height]
@@ -1701,8 +1692,6 @@ final class PanelController: NSObject, NSMenuDelegate {
         effect.frame = b
         container.frame = b
         effect.cornerRadius = collapsed ? Metrics.pillHeight / 2 : 18
-        pillDot.isHidden = !collapsed
-        pillChevron.isHidden = !collapsed
         // 收起/展开共用同一着色：两种状态间不允许出现「液态→磨砂」的质感跳变（用户实测截图）。
         // 绿字在纯白页面上的对比度由玻璃折射本身兜底，实测 α0.60 可读。
         effect.tint = Glass.bodyTint
@@ -1785,21 +1774,29 @@ final class PanelController: NSObject, NSMenuDelegate {
 
     private func pillText() -> String {
         guard let nearest = visibleItems.first else {
-            pillDot.layer?.backgroundColor = NSColor.secondaryLabelColor.cgColor
+            pillLabel.textColor = .secondaryLabelColor
             return "暂无记录"
         }
-        pillDot.layer?.backgroundColor = RowView.urgencyColor(nearest, now: Date()).cgColor
+        pillLabel.textColor = RowView.urgencyColor(nearest, now: Date())
         return Fmt.countdownShort(until: nearest.expiresAt)
     }
 
-    /// 固定文字框与字号，倒计时变化不改变排版，也不把文字缩成难读的小图标。
+    /// 保持原来 54×18 的胶囊尺寸；文字占完整内宽，长倒计时适配字号。
+    /// 不使用 sizeToFit 改变框架，也不对每次数字刷新执行位置或透明度动画。
     private func refitPill() {
         let b = container.bounds
-        pillLabel.font = .monospacedDigitSystemFont(ofSize: Metrics.pillFontSize, weight: .semibold)
+        let available = b.width - 12
+        var size = Metrics.pillFontSize
+        while true {
+            pillLabel.font = .monospacedDigitSystemFont(ofSize: size, weight: .medium)
+            pillLabel.invalidateIntrinsicContentSize()
+            // NSTextField 的 intrinsic 宽度会受当前截断框影响；用完整原文度量并留 cell 内边距。
+            let textWidth = (pillLabel.stringValue as NSString).size(withAttributes: [.font: pillLabel.font!]).width
+            if ceil(textWidth) + 6 <= available || size <= Metrics.pillMinFontSize { break }
+            size -= 0.5
+        }
         pillLabel.alphaValue = 1
-        pillLabel.frame = NSRect(x: 21, y: (b.height - 18) / 2, width: b.width - 39, height: 18)
-        pillDot.frame = NSRect(x: 10, y: (b.height - 6) / 2, width: 6, height: 6)
-        pillChevron.frame = NSRect(x: b.width - 14, y: (b.height - 8) / 2, width: 7, height: 8)
+        pillLabel.frame = NSRect(x: 6, y: (b.height - 14) / 2, width: available, height: 14)
     }
 
     // MARK: 收起 / 展开
@@ -2403,7 +2400,7 @@ final class PanelController: NSObject, NSMenuDelegate {
     var debugCollapseFireDate: Date? { collapseTimer?.fireDate }
     /// TestRender 断言用：自动收起计时器是否已挂（悬停记账错位会表现为常驻或永不收起）
     var debugCollapseScheduled: Bool { collapseTimer != nil }
-    /// TestRender 断言用：胶囊固定可读字号。
+    /// TestRender 断言用：原尺寸胶囊的当前适配字号。
     var debugPillFontSize: CGFloat { pillLabel.font?.pointSize ?? 0 }
     var debugPillLabel: NSTextField { pillLabel }
     func debugShowInlineEditor() {

@@ -97,15 +97,17 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     precondition(self.pc.debugContentView!.bounds.width > 100)
                     snapshot(self.pc.debugContentView!, path: "build/render/panel_expanded.png")
-                    // 2) 收起态：最长的时分组合必须保持可读字号且完整落在文字框内。
+                    // 2) 收起态：最长的时分组合必须在原尺寸内完整显示。
                     var d1long = d1
                     d1long.expiresAt = now.addingTimeInterval(3600 * 23 + 59 * 60)
                     Store.shared.upsertManual(d1long)
                     self.pc.debugSetExpanded(false)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        precondition(self.pc.debugPillFontSize == 11, "长倒计时不得缩成难读字号")
+                        precondition(self.pc.debugContentView!.bounds.size == NSSize(width: 54, height: 18), "胶囊必须保持用户指定的原尺寸54×18")
+                        precondition(self.pc.debugPillFontSize >= 6.5 && self.pc.debugPillFontSize <= 9, "长倒计时应在原字号范围适配")
                         let label = self.pc.debugPillLabel
-                        precondition(label.intrinsicContentSize.width <= label.frame.width, "长倒计时应完整显示")
+                        let fullTextWidth = (label.stringValue as NSString).size(withAttributes: [.font: label.font!]).width
+                        precondition(ceil(fullTextWidth) + 4 <= label.frame.width, "完整原文与cell内边距必须放入胶囊，不能用已截断的intrinsic宽度冒充")
                         precondition(self.pc.debugContentView!.bounds.contains(label.frame), "文字框不得越界")
                         let fixedFrame = label.frame
                         for _ in 0..<12 {
@@ -508,11 +510,11 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         precondition(pw.frame.origin == edge, "贴边收起后应留在 \(edge)，实际 \(pw.frame.origin)")
 
         // ③ 顶部位置保持：展开向下生长，不得把窗口顶到屏幕外
-        let top = NSPoint(x: vis.midX, y: vis.maxY - 30)
+        let top = NSPoint(x: vis.midX, y: vis.maxY - 18)
         pw.setFrameOrigin(top)
         pc.pillClicked()
-        print("ANCHOR: 顶部 expand frame=\(pw.frame) 期望顶边=\(top.y + 30)")
-        precondition(abs(pw.frame.maxY - (top.y + 30)) < 1, "展开应保持顶边不动，实际顶边 \(pw.frame.maxY)")
+        print("ANCHOR: 顶部 expand frame=\(pw.frame) 期望顶边=\(top.y + 18)")
+        precondition(abs(pw.frame.maxY - (top.y + 18)) < 1, "展开应保持顶边不动，实际顶边 \(pw.frame.maxY)")
         precondition(pw.frame.minY >= vis.minY - 1, "展开后面板不得掉到可视区下方之外：\(pw.frame.minY)")
         pc.applyCollapsed(true)
 
@@ -568,7 +570,7 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
 
         // ⑥ 高度封顶 + 滚动：行区超出可视预算时窗口必须限高在可视区内；
         //    滚轮能到底且最后一行完整可见；打开编辑卡增高内容后偏移保持合法；收起回位。
-        let capTop = NSPoint(x: vis.minX + 300, y: vis.maxY - 30)
+        let capTop = NSPoint(x: vis.minX + 300, y: vis.maxY - 18)
         pw.setFrameOrigin(capTop)
         for i in 1...40 {
             var it = SubItem.manualDefault(name: "填充行\(String(format: "%02d", i))", vendor: "其他")
@@ -602,7 +604,7 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         precondition(pc.debugScrollOffset <= max(0, pc.debugRowsContentH - pc.debugViewportH),
                      "⑥ 编辑卡增高内容后偏移必须重新钳制")
         pc.applyCollapsed(true)
-        precondition(pw.frame.height == 30, "⑥ 收起后必须恢复药丸尺寸，实际 \(pw.frame.height)")
+        precondition(pw.frame.height == 18, "⑥ 收起后必须恢复药丸尺寸，实际 \(pw.frame.height)")
         precondition(pw.frame.origin == capTop,
                      "⑥ 收起后应回到药丸原位 \(capTop)，实际 \(pw.frame.origin)")
         print("PASS: 展开锚定药丸自身右缘（中部/贴边/顶部），拖放位置不再被吞掉")
