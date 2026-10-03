@@ -150,13 +150,13 @@ final class GlassPlate: NSGlassEffectView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
-/// 面板/窗口的玻璃底板：装饰层不截获点击，圆角由玻璃自己算。
+/// 面板玻璃宿主：内容经系统 contentView 承载，圆角由玻璃自己算。
 final class GlassSurface: NSView {
     private let glass: NSGlassEffectView
     var cornerRadius: CGFloat = 18 {
         didSet { glass.cornerRadius = cornerRadius }
     }
-    /// 着色可按态切换（收起成胶囊时要比展开态更实，见 layoutChrome）
+    /// 胶囊与展开面板共用同一玻璃着色。
     var tint: NSColor? {
         get { glass.tintColor }
         set { glass.tintColor = newValue }
@@ -176,7 +176,11 @@ final class GlassSurface: NSView {
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    /// 系统只保证 contentView 在玻璃上方；交互内容不能作为玻璃的兄弟视图。
+    var contentView: NSView? {
+        get { glass.contentView }
+        set { glass.contentView = newValue }
+    }
 }
 
 /// 小胶囊悬停只提亮轮廓，不缩放或移动文字，不改变玻璃透明度。
@@ -203,6 +207,7 @@ final class PanelContainerView: NSView {
     var onMouseEnter: (() -> Void)?
     var onMouseExit: (() -> Void)?
     var onBackgroundClick: (() -> Void)?
+    private var pressPoint: NSPoint?
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -212,12 +217,36 @@ final class PanelContainerView: NSView {
                                        owner: self, userInfo: nil))
     }
 
+    override func accessibilityPerformPress() -> Bool {
+        guard accessibilityRole() == .button else { return false }
+        onBackgroundClick?()
+        return true
+    }
+
     override func mouseEntered(with event: NSEvent) { onMouseEnter?() }
     override func mouseExited(with event: NSEvent) { onMouseExit?() }
 
-    // 点击空白处（收起态 = 展开面板）。按钮等控件自己消费点击，不会走到这里。
+    // 点击在松开时提交，拖动超过阈值则交给窗口；按下就展开会吞掉胶囊拖动。
+    override var mouseDownCanMoveWindow: Bool { false }
+
     override func mouseDown(with event: NSEvent) {
-        onBackgroundClick?()
+        pressPoint = event.locationInWindow
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = pressPoint else { return }
+        let p = event.locationInWindow
+        guard hypot(p.x - start.x, p.y - start.y) >= 4 else { return }
+        pressPoint = nil
+        window?.performDrag(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard pressPoint != nil else { return }
+        pressPoint = nil
+        if bounds.contains(convert(event.locationInWindow, from: nil)) {
+            onBackgroundClick?()
+        }
     }
 
 }
@@ -1388,8 +1417,8 @@ final class EditorSheetController: NSWindowController {
 final class PanelController: NSObject, NSMenuDelegate {
     private enum Metrics {
         static let expandedWidth: CGFloat = 240
-        static let pillWidth: CGFloat = 54
-        static let pillHeight: CGFloat = 18
+        static let pillWidth: CGFloat = 112
+        static let pillHeight: CGFloat = 30
         static let dockMargin: CGFloat = 6
         static let headerH: CGFloat = 16
         static let rowH: CGFloat = 28
@@ -1398,8 +1427,7 @@ final class PanelController: NSObject, NSMenuDelegate {
         static let padSide: CGFloat = 8
         static let padTop: CGFloat = 5
         static let padBottom: CGFloat = 5
-        static let pillFontSize: CGFloat = 9
-        static let pillMinFontSize: CGFloat = 6.5
+        static let pillFontSize: CGFloat = 11
         /// 展开面板高度封顶：内容再长也只占可视区，行区转入滚动
         static let minViewportH: CGFloat = 180
         static let screenMargin: CGFloat = 8
@@ -1415,6 +1443,8 @@ final class PanelController: NSObject, NSMenuDelegate {
     private let rowsContainer = NSView()
     private let scrollIndicator = NSView()
     private let pillLabel = NSTextField(labelWithString: "")
+    private let pillDot = NSView()
+    private let pillChevron = NSImageView()
     private let pillHoverOutline = PillHoverOutline()
     private let headerView = NSStackView()
 
@@ -1531,12 +1561,21 @@ final class PanelController: NSObject, NSMenuDelegate {
         headerView.addArrangedSubview(miniBtn("⚙", #selector(openSettings)))
         headerView.addArrangedSubview(miniBtn("✕", #selector(hideClicked)))
 
-        pillLabel.font = .monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+        pillLabel.font = .monospacedDigitSystemFont(ofSize: Metrics.pillFontSize, weight: .semibold)
         pillLabel.alignment = .center
-        pillLabel.lineBreakMode = .byClipping
+        pillLabel.lineBreakMode = .byTruncatingTail
+        pillLabel.maximumNumberOfLines = 1
+        pillLabel.textColor = .white
+        pillLabel.setAccessibilityIdentifier("capsuleCountdown")
+        pillDot.wantsLayer = true
+        pillDot.layer?.cornerRadius = 3
+        pillChevron.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "展开")
+        pillChevron.contentTintColor = NSColor(white: 1, alpha: 0.75)
+        pillChevron.imageScaling = .scaleProportionallyDown
+        pillDot.setAccessibilityElement(false)
+        pillChevron.setAccessibilityElement(false)
 
         container = PanelContainerView()
-        container.addSubview(effect)
         container.addSubview(headerView)
         rowsClip.wantsLayer = true
         rowsClip.layer?.masksToBounds = true
@@ -1548,17 +1587,20 @@ final class PanelController: NSObject, NSMenuDelegate {
         rowsClip.addSubview(scrollIndicator)
         rowsClip.onScroll = { [weak self] dy in self?.applyScroll(deltaY: dy) }
         container.addSubview(rowsClip)
+        container.addSubview(pillDot)
         container.addSubview(pillLabel)
+        container.addSubview(pillChevron)
         pillHoverOutline.alphaValue = 0
         container.addSubview(pillHoverOutline)
-        panel.contentView = container
+        container.autoresizingMask = [.width, .height]
+        effect.contentView = container
+        panel.contentView = effect
 
         container.onMouseEnter = { [weak self] in self?.resyncPointerState() }
         container.onMouseExit = { [weak self] in self?.resyncPointerState() }
         container.onBackgroundClick = { [weak self] in self?.pillClicked() }
 
-        // 右键菜单必须挂在真正接收事件的视图上：effect 的 hitTest 恒返回 nil（Glass 表面只画背景），
-        // 旧实现挂在 effect 上，右键永远调不出（审计 2026-09-29 §4）。container 是命中测试的落点。
+        // 右键菜单挂在玻璃 contentView 上，与胶囊点击、行交互共用真正接收事件的容器。
         container.menu = buildContextMenu()
     }
 
@@ -1581,12 +1623,12 @@ final class PanelController: NSObject, NSMenuDelegate {
     /// （旧实现展开时改用 visibleFrame.maxX，中部拖放的药丸一点就跳到屏幕右缘。）
     private func updateFrame(expanded: Bool, contentH: CGFloat) {
         let prev = panel.frame
-        var topY = prev.maxY
+        var topY = min(prev.maxY, (panel.screen ?? NSScreen.main)?.visibleFrame.maxY ?? prev.maxY)
         let width = expanded ? Metrics.expandedWidth : Metrics.pillWidth
         var height = expanded ? contentH : Metrics.pillHeight
         if expanded, let vis = (panel.screen ?? NSScreen.main)?.visibleFrame {
             if prev.height <= Metrics.pillHeight + 0.5 {
-                expandAnchorTopY = prev.maxY   // 从药丸态展开：记住药丸顶边
+                expandAnchorTopY = topY   // 从药丸态展开：记住药丸顶边
             }
             let availDown = topY - vis.minY - Metrics.screenMargin
             if contentH > availDown {
@@ -1614,6 +1656,9 @@ final class PanelController: NSObject, NSMenuDelegate {
         if let vis = (panel.screen ?? NSScreen.main)?.visibleFrame {
             anchorRight = min(anchorRight, vis.maxX)
             anchorRight = max(anchorRight, vis.minX + width)
+        }
+        if !expanded, let vis = (panel.screen ?? NSScreen.main)?.visibleFrame {
+            topY = min(max(topY, vis.minY + height), vis.maxY)
         }
         panel.setFrame(NSRect(x: anchorRight - width, y: topY - height, width: width, height: height),
                        display: true, animate: false)
@@ -1646,11 +1691,18 @@ final class PanelController: NSObject, NSMenuDelegate {
     private func layoutChrome() {
         guard let b = panel.contentView?.bounds else { return }
         let collapsed = Store.shared.state.panelCollapsed
+        container.setAccessibilityElement(collapsed)
+        container.setAccessibilityRole(collapsed ? .button : .group)
+        container.setAccessibilityLabel(collapsed ? "到期提醒，\(pillText())，点击展开" : nil)
+        pillLabel.setAccessibilityElement(false)
         pillHoverOutline.frame = b
         pillHoverOutline.isHidden = !collapsed
         if !collapsed { pillHoverOutline.alphaValue = 0 }
         effect.frame = b
-        effect.cornerRadius = collapsed ? 9 : 18
+        container.frame = b
+        effect.cornerRadius = collapsed ? Metrics.pillHeight / 2 : 18
+        pillDot.isHidden = !collapsed
+        pillChevron.isHidden = !collapsed
         // 收起/展开共用同一着色：两种状态间不允许出现「液态→磨砂」的质感跳变（用户实测截图）。
         // 绿字在纯白页面上的对比度由玻璃折射本身兜底，实测 α0.60 可读。
         effect.tint = Glass.bodyTint
@@ -1661,7 +1713,7 @@ final class PanelController: NSObject, NSMenuDelegate {
             rowsClip.isHidden = true
             pillLabel.isHidden = false
             pillLabel.stringValue = pillText()
-            pillLabel.toolTip = Self.upcomingTooltip(allItems)
+            pillLabel.toolTip = Self.upcomingTooltip(visibleItems) + "\n点击展开 · 拖动移动"
             refitPill()
         } else {
             pillLabel.isHidden = true
@@ -1732,29 +1784,22 @@ final class PanelController: NSObject, NSMenuDelegate {
     }
 
     private func pillText() -> String {
-        guard let nearest = visibleItems.first else { return "⏳" }   // 归档条目不占据药丸
-        let text = Fmt.countdownShort(until: nearest.expiresAt)
-        pillLabel.textColor = RowView.urgencyColor(nearest, now: Date())
-        return text
+        guard let nearest = visibleItems.first else {
+            pillDot.layer?.backgroundColor = NSColor.secondaryLabelColor.cgColor
+            return "暂无记录"
+        }
+        pillDot.layer?.backgroundColor = RowView.urgencyColor(nearest, now: Date()).cgColor
+        return Fmt.countdownShort(until: nearest.expiresAt)
     }
 
-    /// 药丸文本布局：可用宽仅 54−12=42pt，放不下就按 0.5pt 阶梯缩小字号（下限 6.5pt）防硬裁剪。
-    /// 宽度用 label 自身 intrinsicContentSize 度量——含真实字体度量与字距，比 NSAttributedString
-    /// 估算更可靠（「16时12分」估算 45.2 vs 实际 45.5，估算贴边就会漏缩）。
+    /// 固定文字框与字号，倒计时变化不改变排版，也不把文字缩成难读的小图标。
     private func refitPill() {
-        let avail = container.bounds.width - 12
-        var size = Metrics.pillFontSize
-        while size > Metrics.pillMinFontSize {
-            pillLabel.font = .monospacedDigitSystemFont(ofSize: size, weight: .medium)
-            pillLabel.invalidateIntrinsicContentSize()
-            if ceil(pillLabel.intrinsicContentSize.width) <= avail { break }
-            size -= 0.5
-        }
-        pillLabel.font = .monospacedDigitSystemFont(ofSize: size, weight: .medium)
-        pillLabel.sizeToFit()
         let b = container.bounds
-        pillLabel.frame = NSRect(x: 6, y: (b.height - pillLabel.frame.height) / 2,
-                                 width: b.width - 12, height: pillLabel.frame.height)
+        pillLabel.font = .monospacedDigitSystemFont(ofSize: Metrics.pillFontSize, weight: .semibold)
+        pillLabel.alphaValue = 1
+        pillLabel.frame = NSRect(x: 21, y: (b.height - 18) / 2, width: b.width - 39, height: 18)
+        pillDot.frame = NSRect(x: 10, y: (b.height - 6) / 2, width: 6, height: 6)
+        pillChevron.frame = NSRect(x: b.width - 14, y: (b.height - 8) / 2, width: 7, height: 8)
     }
 
     // MARK: 收起 / 展开
@@ -1907,23 +1952,13 @@ final class PanelController: NSObject, NSMenuDelegate {
             for case let row as RowView in rowsContainer.subviews {
                 if let item = row.item { row.configure(item, now: now) }
             }
-        } else if !items.isEmpty {
-            let nearest = items[0]
-            let text = Fmt.countdownShort(until: nearest.expiresAt, now: now)
+        } else {
+            // 即时替换数字；最后一分钟、跨重置点、空库都走同一条稳定布局路径。
+            let text = pillText()
             if text != pillLabel.stringValue {
-                let color = RowView.urgencyColor(nearest, now: now)
-                if nearest.expiresAt.timeIntervalSince(now) < 120 {
-                    // 最后两分钟文本每秒变化，直接更新避免持续闪烁
-                    pillLabel.stringValue = text
-                    pillLabel.textColor = color
-                    refitPill()
-                } else {
-                    Motion.crossfadeText(pillLabel) {
-                        self.pillLabel.stringValue = text
-                        self.pillLabel.textColor = color
-                        self.refitPill()
-                    }
-                }
+                pillLabel.stringValue = text
+                container.setAccessibilityLabel("到期提醒，\(text)，点击展开")
+                refitPill()
             }
         }
 
@@ -2361,15 +2396,16 @@ final class PanelController: NSObject, NSMenuDelegate {
     /// TestRender 注入：非 nil 时代替真实光标参与悬停/自动收起判定，正式运行恒为 nil。
     static var debugCursorOverride: NSPoint?
 
-    var debugContentView: NSView? { panel.contentView }
+    var debugContentView: NSView? { container }
     /// TestRender 断言用：跑一次心跳兜底重算（tick() 里同一段，测试避免触发临期模态弹窗）
     func debugHeartbeatResync() { heartbeatPointerResync() }
     /// TestRender 断言用：计时器触发时刻；重复心跳不得把它一路往后推
     var debugCollapseFireDate: Date? { collapseTimer?.fireDate }
     /// TestRender 断言用：自动收起计时器是否已挂（悬停记账错位会表现为常驻或永不收起）
     var debugCollapseScheduled: Bool { collapseTimer != nil }
-    /// TestRender 断言用：药丸当前字号（验证长倒计时触发的自适应缩小）
+    /// TestRender 断言用：胶囊固定可读字号。
     var debugPillFontSize: CGFloat { pillLabel.font?.pointSize ?? 0 }
+    var debugPillLabel: NSTextField { pillLabel }
     func debugShowInlineEditor() {
         if let first = Store.shared.manualItems.first(where: { !$0.isAuto }) {
             editingId = first.id

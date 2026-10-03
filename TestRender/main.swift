@@ -1,7 +1,7 @@
 import AppKit
 
 // 离屏渲染自测：把悬浮窗（展开/收起）、设置后台、编辑表单渲染成 PNG 供人工检查，
-// 并对极简表单 / 智能保存管线 / 药丸字号自适应做行为断言。
+// 并对极简表单 / 智能保存管线 / 胶囊稳定文字布局做行为断言。
 // 只编译进测试产物（TestRender），不影响正式 .app。
 
 func snapshot(_ view: NSView, path: String) {
@@ -56,11 +56,16 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         //    新用户第一眼应该看到自动展开的「暂无条目，点 ＋ 添加」，而不是裸 ⏳ 药丸
         pc = PanelController(loadOfficialData: false)
         pc.showPanel()
+        let glassHost = pc.debugContentView?.window?.contentView as? GlassSurface
+        precondition(glassHost?.contentView === pc.debugContentView,
+                     "文字和交互必须由玻璃 contentView 承载，不能放在不保证层级的兄弟视图")
         precondition(Store.shared.state.autoExpandDone == true,
                      "⑦ 首次 showPanel 应写入引导标记，实际 \(String(describing: Store.shared.state.autoExpandDone))")
         precondition(pc.debugContentView?.window?.frame.width == 240,
                      "⑦ 空库首启应自动展开面板露出引导文案，实际宽 \(pc.debugContentView?.window?.frame.width ?? 0)")
         pc.applyCollapsed(true)   // 回到收起态，后续截图流程从药丸开始
+        precondition(pc.debugPillLabel.stringValue == "暂无记录", "空胶囊必须说明当前状态")
+        precondition(pc.debugPillLabel.alphaValue == 1, "空状态不得继承倒计时的透明度")
         if let win = pc.debugContentView?.window {   // 光标固定在面板内取消计时器：测试期间不得被 8s 收起打断
             PanelController.debugCursorOverride = NSPoint(x: win.frame.midX, y: win.frame.midY)
             pc.debugHeartbeatResync()
@@ -92,13 +97,24 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     precondition(self.pc.debugContentView!.bounds.width > 100)
                     snapshot(self.pc.debugContentView!, path: "build/render/panel_expanded.png")
-                    // 2) 收起态（贴边药丸）。先把最近条目推到「23时59分」（4 数字+3 汉字 > 42pt 可用宽）压测字号自适应
+                    // 2) 收起态：最长的时分组合必须保持可读字号且完整落在文字框内。
                     var d1long = d1
                     d1long.expiresAt = now.addingTimeInterval(3600 * 23 + 59 * 60)
                     Store.shared.upsertManual(d1long)
                     self.pc.debugSetExpanded(false)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        precondition(self.pc.debugPillFontSize < 9, "长倒计时应触发药丸字号自适应缩小")
+                        precondition(self.pc.debugPillFontSize == 11, "长倒计时不得缩成难读字号")
+                        let label = self.pc.debugPillLabel
+                        precondition(label.intrinsicContentSize.width <= label.frame.width, "长倒计时应完整显示")
+                        precondition(self.pc.debugContentView!.bounds.contains(label.frame), "文字框不得越界")
+                        let fixedFrame = label.frame
+                        for _ in 0..<12 {
+                            self.pc.debugSetExpanded(true)
+                            self.pc.debugSetExpanded(false)
+                        }
+                        precondition(label.frame == fixedFrame && label.alphaValue == 1,
+                                     "重复展开/收起不得裁剪或淡出倒计时")
+                        print("PASS: 胶囊长倒计时可读、重复切换文字框稳定")
                         snapshot(self.pc.debugContentView!, path: "build/render/panel_pill.png")
                         // 3) 设置后台
                         let sc = SettingsWindowController(panel: self.pc)
@@ -459,7 +475,18 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         let mid = NSPoint(x: vis.minX + 300, y: vis.minY + 400)
         pw.setFrameOrigin(mid)
         let pillRight = pw.frame.maxX
-        pc.pillClicked()
+        let gestureContainer = content as! PanelContainerView
+        let clickPoint = NSPoint(x: content.bounds.midX, y: content.bounds.midY)
+        let down = NSEvent.mouseEvent(with: .leftMouseDown, location: clickPoint,
+                                     modifierFlags: [], timestamp: 0, windowNumber: pw.windowNumber,
+                                     context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+        let up = NSEvent.mouseEvent(with: .leftMouseUp, location: clickPoint,
+                                   modifierFlags: [], timestamp: 0.1, windowNumber: pw.windowNumber,
+                                   context: nil, eventNumber: 2, clickCount: 1, pressure: 0)!
+        gestureContainer.mouseDown(with: down)
+        precondition(Store.shared.state.panelCollapsed, "按下胶囊不得抢先展开、吞掉拖动")
+        gestureContainer.mouseUp(with: up)
+        precondition(!Store.shared.state.panelCollapsed, "合法松开才展开胶囊")
         print("ANCHOR: 中部 expand 前右缘=\(pillRight) 展开后 frame=\(pw.frame)")
         precondition(pw.frame.width == 240, "点击药丸应展开面板，实际宽 \(pw.frame.width)")
         precondition(abs(pw.frame.maxX - pillRight) < 1,
@@ -470,7 +497,7 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         precondition(pw.frame.origin == mid, "收起后药丸应留在拖放位置 \(mid)，实际跑到 \(pw.frame.origin)")
 
         // ② 贴屏幕右缘（原有默认位置）：展开/收起都必须待在原处
-        let edge = NSPoint(x: vis.maxX - 54, y: vis.minY + 300)
+        let edge = NSPoint(x: vis.maxX - pw.frame.width, y: vis.minY + 300)
         pw.setFrameOrigin(edge)
         pc.pillClicked()
         print("ANCHOR: 贴边 expand frame=\(pw.frame) 期望右缘=\(vis.maxX)")
@@ -481,11 +508,11 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         precondition(pw.frame.origin == edge, "贴边收起后应留在 \(edge)，实际 \(pw.frame.origin)")
 
         // ③ 顶部位置保持：展开向下生长，不得把窗口顶到屏幕外
-        let top = NSPoint(x: vis.midX, y: vis.maxY - 18)
+        let top = NSPoint(x: vis.midX, y: vis.maxY - 30)
         pw.setFrameOrigin(top)
         pc.pillClicked()
-        print("ANCHOR: 顶部 expand frame=\(pw.frame) 期望顶边=\(top.y + 18)")
-        precondition(abs(pw.frame.maxY - (top.y + 18)) < 1, "展开应保持顶边不动，实际顶边 \(pw.frame.maxY)")
+        print("ANCHOR: 顶部 expand frame=\(pw.frame) 期望顶边=\(top.y + 30)")
+        precondition(abs(pw.frame.maxY - (top.y + 30)) < 1, "展开应保持顶边不动，实际顶边 \(pw.frame.maxY)")
         precondition(pw.frame.minY >= vis.minY - 1, "展开后面板不得掉到可视区下方之外：\(pw.frame.minY)")
         pc.applyCollapsed(true)
 
@@ -541,7 +568,7 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
 
         // ⑥ 高度封顶 + 滚动：行区超出可视预算时窗口必须限高在可视区内；
         //    滚轮能到底且最后一行完整可见；打开编辑卡增高内容后偏移保持合法；收起回位。
-        let capTop = NSPoint(x: vis.minX + 300, y: vis.maxY - 18)
+        let capTop = NSPoint(x: vis.minX + 300, y: vis.maxY - 30)
         pw.setFrameOrigin(capTop)
         for i in 1...40 {
             var it = SubItem.manualDefault(name: "填充行\(String(format: "%02d", i))", vendor: "其他")
@@ -575,7 +602,7 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         precondition(pc.debugScrollOffset <= max(0, pc.debugRowsContentH - pc.debugViewportH),
                      "⑥ 编辑卡增高内容后偏移必须重新钳制")
         pc.applyCollapsed(true)
-        precondition(pw.frame.height == 18, "⑥ 收起后必须恢复药丸尺寸，实际 \(pw.frame.height)")
+        precondition(pw.frame.height == 30, "⑥ 收起后必须恢复药丸尺寸，实际 \(pw.frame.height)")
         precondition(pw.frame.origin == capTop,
                      "⑥ 收起后应回到药丸原位 \(capTop)，实际 \(pw.frame.origin)")
         print("PASS: 展开锚定药丸自身右缘（中部/贴边/顶部），拖放位置不再被吞掉")
