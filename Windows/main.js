@@ -18,9 +18,10 @@ let official = [], statuses = [], manual = [], reminderHours = {}, lastAlert = n
 let minimumHostHeight = 18;
 const timerHandles = [];
 function startArguments() { return app.isPackaged ? [] : [__dirname]; }
+function acceptanceArguments() { return process.argv.includes('--resident-acceptance-child') ? ['--resident-acceptance-child','--disable-gpu'] : []; }
 function startWatchdog() {
   if (smoke || process.platform !== 'win32' || !store.state.resident || watchdog) return;
-  watchdog = spawn(process.execPath,[...startArguments(),'--watchdog',String(process.pid)],{detached:true,stdio:'ignore',windowsHide:true,env:{...process.env,AR_DATA_DIR:directory}});
+  watchdog = spawn(process.execPath,[...startArguments(),'--watchdog',...acceptanceArguments(),String(process.pid)],{detached:true,stdio:'ignore',windowsHide:true,env:{...process.env,AR_DATA_DIR:directory}});
   watchdog.unref();
   watchdog.on('exit',() => { watchdog = null; });
 }
@@ -220,7 +221,7 @@ if (watchdogMode) {
       catch {
         try {
           const state = JSON.parse(fs.readFileSync(path.join(directory,'state.json'),'utf8'));
-          if (state.resident) { const child = spawn(process.execPath,startArguments(),{detached:true,stdio:'ignore',windowsHide:true,env:{...process.env,AR_DATA_DIR:directory}}); child.unref(); }
+          if (state.resident) { const child = spawn(process.execPath,[...startArguments(),...acceptanceArguments()],{detached:true,stdio:'ignore',windowsHide:true,env:{...process.env,AR_DATA_DIR:directory}}); child.unref(); }
         } finally { app.quit(); }
       }
     },2000);
