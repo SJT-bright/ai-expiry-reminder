@@ -2,6 +2,49 @@ import Foundation
 
 // MARK: - 数据模型
 
+/// 提前量以整小时保存；天和小时仅为输入形式。
+enum ReminderTiming {
+    static let defaultHours = 5
+    static let maxDays = 3650
+    static let maxHours = maxDays * 24 + 23
+
+    static func hours(days: String, hours: String) -> Int? {
+        guard let d = Int(days.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let h = Int(hours.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (0...maxDays).contains(d), (0...23).contains(h), d > 0 || h > 0 else { return nil }
+        return d * 24 + h
+    }
+
+    static func label(hours: Int) -> String {
+        let days = hours / 24, remainder = hours % 24
+        let parts = [(days > 0 ? "\(days) 天" : nil),
+                     (remainder > 0 ? "\(remainder) 小时" : nil)].compactMap { $0 }
+        return "提前 " + parts.joined(separator: " ")
+    }
+
+    /// 周期必须长于提前量，避免刚滚动就进入提醒区间。
+    static func allowsAlert(_ item: SubItem, hours: Int) -> Bool {
+        guard (1...maxHours).contains(hours) else { return false }
+        guard item.kind == .window else { return true }
+        let threshold = Double(hours) * 3600
+        switch item.resetRule {
+        case .calendarWeek: return threshold < 7 * 86400
+        case .calendarMonth, .anchorMonth:
+            guard let previous = Calendar.current.date(byAdding: .month, value: -1, to: item.expiresAt) else { return false }
+            return threshold < item.expiresAt.timeIntervalSince(previous)
+        default:
+            guard let period = item.repeatHours, period.isFinite, period > 0 else { return true }
+            return Double(hours) < period
+        }
+    }
+
+    static func isDue(_ item: SubItem, hours: Int, now: Date) -> Bool {
+        let remaining = item.expiresAt.timeIntervalSince(now)
+        return !item.isArchived && remaining > 0 && remaining <= Double(hours) * 3600
+            && allowsAlert(item, hours: hours)
+    }
+}
+
 enum ItemKind: String, Codable {
     case subscription   // 订阅到期（一次性，如 ChatGPT Pro 月付、重置卡）
     case window         // 周期额度窗口（到期后自动滚动，如 Codex 5小时窗口）
@@ -37,16 +80,58 @@ struct SubItem: Codable, Equatable {
     var updatedAt: Date?            // 只读，来自 DB updated_at（JSON 解码 decodeIfPresent 容错）
 
     /// 仅识别按周拆分生成的订阅，避免把派生重置窗口当作下一周。
+    /// 身份只挂在名称「·第k/n周」上（DB 无 week_index 列）：用户改过名称这里就返回 nil，
+    /// 由 Store.upsertManual 记录「无法识别周序」证据，不再静默跳过重排。
     var weekIndex: Int? {
         guard kind == .subscription, groupID != nil,
               let range = name.range(of: "·第[0-9]+/[0-9]+周$", options: .regularExpression) else { return nil }
         return Int(name[range].dropFirst(2).split(separator: "/")[0])
     }
 
+    /// 周组身份是否已丢失：属于周组的订阅条目名称脱离了「·第k/n周」格式 → weekIndex 解析不出，
+    /// 分周重排会整套失效（真修要给 items 加 week_index 列，见 HANDOFF）。
+    var weeklyIdentityUnresolved: Bool {
+        kind == .subscription && groupID != nil && weekIndex == nil
+    }
+
     var isAuto: Bool { source != "manual" }
 
     /// 是否已归档（过期后自动/手动归档；归档条目在列表沉底，超过保留期后清除）
     var isArchived: Bool { archivedAt != nil }
+
+    /// 展示口径（唯一判据）：条目过期后还应该出现在面板/药丸/菜单栏吗？
+    /// ① 已归档 → 不展示；
+    /// ② 还能滚出下一轮的活额度窗口 → 展示（它只是在等下一轮，不是「死了」）；
+    /// ③ 其余（一次性订阅、规则残缺的窗口、官方 auto:* 条目）→ 过期满宽限期后不再展示。
+    /// 宽限期与自动归档同阈值（Store.archiveAfterDays）：归档/清理/展示共用一个口径，
+    /// 不会出现「面板还显示、库里已判死」或「面板消失、清理又把它删了」的口径裂缝。
+    /// 官方条目不进 SQLite（archivedAt 恒 nil），它们过期后的隐藏只能由 UI 侧用本判据过滤。
+    func isDisplayable(now: Date = Date(), graceDays: Double = Store.archiveAfterDays) -> Bool {
+        if archivedAt != nil { return false }
+        if nextRoll(after: now) != nil { return true }
+        let grace = (graceDays.isFinite && graceDays > 0) ? graceDays : 0
+        guard expiresAt.timeIntervalSince1970.isFinite, now.timeIntervalSince1970.isFinite else { return false }
+        return expiresAt.addingTimeInterval(grace * 86400) > now
+    }
+
+    /// 是否落在展示窗口内。与设置表「剩余」列的整天口径一致：
+    /// floor(剩余秒 / 86400) ≤ displayHorizonDays 才展示（默认 40 天显示，41 天起不显示）。
+    /// 已过期（剩余 ≤ 0）仍算在窗口内，面板是否露面另由 isDisplayable 决定。
+    /// 非有限时间戳不展示。不足一整天（floor 为 0）仍展示，不加「至少 1 天」下限。
+    func isWithinDisplayHorizon(now: Date = Date()) -> Bool {
+        let remain = expiresAt.timeIntervalSince(now)
+        guard remain.isFinite else { return false }
+        if remain <= 0 { return true }
+        return floor(remain / 86400) <= Double(Store.shared.displayHorizonDays)
+    }
+
+    /// 「窗口却滚不动」：kind == .window 但算不出下一轮（repeatHours 丢失或被清洗置 nil、
+    /// 日历规则的 resetParam 为 NULL、DB 里未知 reset_rule 读回静默变 nil）。
+    /// 这是**规则残缺**而不是「一次性到期」：只允许归档，绝不能被清理删除——
+    /// 删掉的就是用户手录、还在消耗的活额度窗口，且不可恢复。
+    func hasUnresolvableRoll(after now: Date = Date()) -> Bool {
+        kind == .window && nextRoll(after: now) == nil
+    }
 
     /// 本轮到期后能否再滚出一轮；nil = 滚不动（非窗口 / 已归档 / repeatHours 与日历参数无效）。
     /// 「能不能滚」只有一个判据：nextRollInstant、rollManualWindows、「清理过期」三处共用，
@@ -94,9 +179,10 @@ struct SubItem: Codable, Equatable {
     func nextCalendarReset(after now: Date, calendar: Calendar = .current) -> Date? {
         guard resetRule == .calendarMonth || resetRule == .calendarWeek || resetRule == .anchorMonth else { return nil }
         func clampDay(_ day: Int, in date: Date) -> Date? {
-            let days = calendar.range(of: .day, in: .month, for: date)!.count
+            // range(of:in:for:) 对极端日期（DB 里被改坏的 REAL）可返回 nil，不能强解包
+            guard let range = calendar.range(of: .day, in: .month, for: date) else { return nil }
             var comps = calendar.dateComponents([.year, .month], from: date)
-            comps.day = min(day, days)
+            comps.day = min(day, range.count)
             comps.hour = 0; comps.minute = 0; comps.second = 0
             return calendar.date(from: comps)
         }
@@ -104,21 +190,25 @@ struct SubItem: Codable, Equatable {
         case .calendarMonth, .anchorMonth:
             guard let day = resetParam, (1...31).contains(day) else { return nil }
             var candidate = clampDay(day, in: now) ?? now
-            while candidate <= now {   // 本月节点已过 → 下月（再钳制）
+            var hops = 0
+            while candidate <= now, hops < 25 {   // 本月节点已过 → 下月（再钳制）
                 let next = calendar.date(byAdding: .month, value: 1, to: candidate) ?? candidate
                 candidate = clampDay(day, in: next) ?? next
+                hops += 1
             }
-            return candidate
+            // hops 上限兜底：极端/非法 now 让 clampDay 一路返回 nil 时，candidate 会原地不动，
+            // 没有上限就是主线程死循环（tick 每秒走一次这条路）。
+            return candidate > now ? candidate : nil
         case .calendarWeek:
             guard let param = resetParam, (1...7).contains(param) else { return nil }
             let targetWeekday = param == 7 ? 1 : param + 1   // 参数 1=周一…7=周日 → Calendar 1=周日
             let weekday = calendar.component(.weekday, from: now)
-            var comps = calendar.dateComponents([.year, .month, .day], from: now)
             var shift = (targetWeekday - weekday + 7) % 7
-            if shift == 0 { shift = 7 }                      // 今天即是该星期几 → 下周（00:00 已过即失去意义）
-            comps.day! += shift
-            comps.hour = 0; comps.minute = 0; comps.second = 0
-            return calendar.date(from: comps)
+            if shift == 0 { shift = 7 }                      // 今天即是该星期几 → 下周（今天00:00已过即算下周）
+            // startOfDay + byAdding(.day)：不再用 comps.day += shift。
+            // 后者依赖 Calendar.date(from:) 对越界 day 的「回卷」行为（旧 Foundation 曾按「钳到月末」实现，
+            // 月末 +N 天会得到不存在的日期），byAdding 交给日历自己做月/年进位与夏令时。
+            return calendar.date(byAdding: .day, value: shift, to: calendar.startOfDay(for: now))
         default:
             return nil
         }
@@ -129,9 +219,9 @@ struct SubItem: Codable, Equatable {
     func previousCalendarReset(before now: Date, calendar: Calendar = .current) -> Date? {
         guard nextCalendarReset(after: now, calendar: calendar) != nil else { return nil }
         func clampDay(_ day: Int, in date: Date) -> Date? {
-            let days = calendar.range(of: .day, in: .month, for: date)!.count
+            guard let range = calendar.range(of: .day, in: .month, for: date) else { return nil }
             var comps = calendar.dateComponents([.year, .month], from: date)
-            comps.day = min(day, days)
+            comps.day = min(day, range.count)
             comps.hour = 0; comps.minute = 0; comps.second = 0
             return calendar.date(from: comps)
         }
@@ -162,14 +252,18 @@ struct SubItem: Codable, Equatable {
                 groupID: nil)
     }
 
-    /// 按周划分额度：以到期日为锚点倒推，每 7 天一个窗口，
+    /// 按周划分额度：以到期日为锚点**倒推**，每 7 天一个窗口，
     /// 不足 7 天的零头作为第一个窗口（例：还剩 10 天 → 提醒点在 3 天后和 10 天后）。
     /// 返回的条目共享 groupID。
+    /// 注意：这是「自到期日倒推」的老口径，生产写入路径已改用 Store.saveWeeklySplit
+    /// （自首次重置**正推**，末轮叠不满订阅到期），两者方向相反；本方法现仅存留兼容与测试。
     func splitWeekly(from start: Date = Date()) -> [SubItem] {
         let week: TimeInterval = 7 * 86400
         let total = expiresAt.timeIntervalSince(start)
-        guard total > week else { return [self] }   // 不足一周无需划分
-        let n = Int(ceil(total / week))
+        guard total.isFinite, total > week else { return [self] }   // 不足一周无需划分
+        // 轮次上限与 saveWeeklySplit 同一个常量：Int(ceil(极端值)) 会直接 trap 掉进程
+        let n = Int(min(ceil(total / week), Double(Store.maxWeeklySplits)))
+        guard n >= 1 else { return [self] }
         let gid = UUID().uuidString
         return (1...n).map { k in
             var v = self
@@ -195,20 +289,26 @@ extension SubItem {
         case purchaseAt, archivedAt, updatedAt
     }
 
-    /// 旧数据（state.json 迁移源 / 旧版 SQLite）缺少新字段时按 nil 容错
+    /// 旧数据（state.json 迁移源 / 旧版 SQLite）缺少新字段时按 nil 容错。
+    /// 容错分级：
+    /// - 可给安全默认的键（kind/source/note/vendor）一律 decodeIfPresent + 兜底，
+    ///   未知 kind rawValue（旧版本枚举）退化为 .subscription，不让整行解码失败；
+    /// - 只有 id / expiresAt 才是硬失败——没有主键或没有到期时间的记录无从展示，
+    ///   由 Store.migrateLegacyManualItems 保留原始行等待人工修复（不整批放弃）。
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
-        name = try c.decode(String.self, forKey: .name)
-        vendor = try c.decode(String.self, forKey: .vendor)
-        kind = try c.decode(ItemKind.self, forKey: .kind)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        vendor = try c.decodeIfPresent(String.self, forKey: .vendor) ?? ""
+        // 未知 rawValue 用 String 接住再映射：decodeIfPresent(ItemKind.self) 对陌生值仍会抛错
+        kind = ItemKind(rawValue: (try c.decodeIfPresent(String.self, forKey: .kind)) ?? "") ?? .subscription
         expiresAt = try c.decode(Date.self, forKey: .expiresAt)
         repeatHours = try c.decodeIfPresent(Double.self, forKey: .repeatHours)
-        source = try c.decode(String.self, forKey: .source)
-        note = try c.decode(String.self, forKey: .note)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "manual"
+        note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
         usedPercent = try c.decodeIfPresent(Double.self, forKey: .usedPercent)
         groupID = try c.decodeIfPresent(String.self, forKey: .groupID)
-        resetRule = try c.decodeIfPresent(ResetRule.self, forKey: .resetRule)
+        resetRule = ResetRule(rawValue: (try c.decodeIfPresent(String.self, forKey: .resetRule)) ?? "")
         resetParam = try c.decodeIfPresent(Int.self, forKey: .resetParam)
         purchaseAt = try c.decodeIfPresent(Date.self, forKey: .purchaseAt)
         archivedAt = try c.decodeIfPresent(Date.self, forKey: .archivedAt)
@@ -403,12 +503,43 @@ struct AutoCollapseSuppressor: Equatable {
 }
 
 /// 设置（轻量 KV，走 state.json）；记录类数据全部在 SQLite。
-/// 旧 state.json 里已删除的 key（如 notifiedKeys/feishuWebhook）由合成 Codable 自动忽略。
+/// 旧 state.json 里已删除的 key（如 notifiedKeys/feishuWebhook）解码时忽略。
+/// 不能用合成 Codable：缺键会让整份 AppState 解码失败，从而把 panelCollapsed / dismissedAuto 重置。
+/// 手写解码对每个字段 decodeIfPresent，缺键用当前默认值，天数再经 clamp。
 struct AppState: Codable {
     var panelCollapsed: Bool = true
+    var panelAutoCollapse: Bool = false
     var dismissedAuto: [String] = []   // 被用户隐藏的官方条目 id（⟳ 刷新可恢复）
     /// 首次启动引导已给过（空库自动展开一次）；nil = 旧版本状态文件，首次 showPanel 时置位
     var autoExpandDone: Bool?
+    /// 展示未来多少天内到期。只影响显示判断，保存周次时不按这个天数裁数据库。
+    var displayHorizonDays: Int = 40
+}
+
+// 自定义 Codable 放在扩展里：避免吞掉成员默认值构造器 AppState()。
+extension AppState {
+    private enum CodingKeys: String, CodingKey {
+        case panelCollapsed, panelAutoCollapse, dismissedAuto, autoExpandDone, displayHorizonDays
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        panelCollapsed = try c.decodeIfPresent(Bool.self, forKey: .panelCollapsed) ?? true
+        panelAutoCollapse = try c.decodeIfPresent(Bool.self, forKey: .panelAutoCollapse) ?? false
+        dismissedAuto = try c.decodeIfPresent([String].self, forKey: .dismissedAuto) ?? []
+        autoExpandDone = try c.decodeIfPresent(Bool.self, forKey: .autoExpandDone)
+        let rawDays = try c.decodeIfPresent(Int.self, forKey: .displayHorizonDays) ?? Store.defaultDisplayHorizonDays
+        displayHorizonDays = Store.clampDisplayHorizonDays(rawDays)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(panelCollapsed, forKey: .panelCollapsed)
+        try c.encode(panelAutoCollapse, forKey: .panelAutoCollapse)
+        try c.encode(dismissedAuto, forKey: .dismissedAuto)
+        try c.encodeIfPresent(autoExpandDone, forKey: .autoExpandDone)
+        try c.encode(displayHorizonDays, forKey: .displayHorizonDays)
+    }
 }
 
 /// 手动条目写入结果：区分「完全失败」「已保存但关联同步失败」「全部成功」
@@ -436,6 +567,12 @@ final class Store {
     let dir: URL
     private let settingsFileURL: URL
     private let queue = DispatchQueue(label: "store.io")
+    /// Application Support 根目录（系统域名拿不到时兜底到家目录，避免 first! 强解崩溃）
+    static var appSupportDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+    }
     // 迁移未完整完成时，后续设置保存也必须保留旧记录，不能旁路删除。
     private var pendingLegacyManualItems: Any?
 
@@ -445,6 +582,34 @@ final class Store {
     private(set) var manualItems: [SubItem] = []
     /// 数据版本号：任何变更（写入/删除/滚动/归档/清理）成功路径 +1；UI 用它做变更检测
     private(set) var dataVersion: Int = 0
+    /// 按条目 id 保存，官方刷新/分周重排不会覆盖提前量。
+    private var reminderHoursByID: [String: Int] = [:]
+    /// 事务嵌套深度：>0 时写入只记账不 bump dataVersion——事务回滚后版本号必须不变，
+    /// 否则 PanelUI 会为一次根本没落库的「变更」白重建一遍。
+    private var transactionDepth = 0
+    /// 本次事务里是否真的写过（决定提交成功后要不要 bump）
+    private var wroteInsideTransaction = false
+    /// 上一次读库是否完整。半读（step 以 BUSY/NOMEM/CORRUPT 退出）时**不覆盖** manualItems，
+    /// 缓存因此始终是「最近一次完整快照」；但归档/清理/删除名单在补读成功前一律不基于它决策。
+    private var dbReadIncomplete = false
+
+    /// 从 SQLite 重读手动条目。只在读完整时才替换内存缓存——
+    /// 残缺集合会让 align_week、清理过期、归档按「条目不存在」来做破坏性判断。
+    @discardableResult
+    private func reloadManualItems() -> Bool {
+        let snap = db.loadItemsChecked()
+        guard snap.complete else {
+            dbReadIncomplete = true
+            NSLog("AR: 库读取不完整（DB 忙/中断），保留现有 \(manualItems.count) 条缓存，本次不做删除类决策")
+            return false
+        }
+        if snap.ignored > 0 {
+            NSLog("AR: 库读取跳过坏行 \(snap.ignored) 条（详见上一条带 id 的告警），其余 \(snap.items.count) 条正常载入")
+        }
+        dbReadIncomplete = false
+        manualItems = snap.items
+        return true
+    }
 
     /// environment 参数供测试注入隔离/故障数据目录（如只读目录构造写失败）
     init(environment: [String: String] = ProcessInfo.processInfo.environment) {
@@ -452,12 +617,16 @@ final class Store {
         if let override = environment["AR_DATA_DIR"] {
             base = URL(fileURLWithPath: override, isDirectory: true)
         } else {
-            base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            // 不 urls(for:).first! 强解；理论上不会失败，兜底到家目录。
+            // 刻意留在数据层自己解析：test_logic/test_migration 只编 Models+Database+Vendors，
+            // 引常驻层（Resident）会把这两个测试切面的编译集撑开。
+            base = Store.appSupportDirectory
         }
         dir = base.appendingPathComponent("AI到期提醒", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         settingsFileURL = dir.appendingPathComponent("state.json")
         db = Database(dir: dir)
+        reminderHoursByID = db.loadReminderHours()
 
         // 设置加载
         if let data = try? Data(contentsOf: settingsFileURL),
@@ -466,11 +635,16 @@ final class Store {
         }
 
         migrateLegacyManualItems()
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
         rollManualWindows()
     }
 
-    /// 旧版 state.json 里的 manualItems 迁移进数据库（一次性，幂等）
+    /// 旧版 state.json 里的 manualItems 迁移进数据库（一次性，幂等，**逐行 best-effort**）。
+    /// 一行坏（未知 kind rawValue、缺字段、日期非 ISO8601）绝不能拖垮整批：
+    /// 旧实现任一行解码失败就整批 return，而 init 之后只读 DB、不再兜底 state.json
+    /// → 用户面板直接变成「暂无条目」，以为记录全没了。
+    /// 现在：好行照常入库，坏行原样留在 state.json 的 manualItems 键里（pendingLegacyManualItems
+    /// 兜底，save() 不会旁路删除），下次启动继续重试，并在 NSLog 报告「成功 N 行/坏 M 行」。
     private func migrateLegacyManualItems() {
         guard let data = try? Data(contentsOf: settingsFileURL),
               var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -483,15 +657,24 @@ final class Store {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         var items: [SubItem] = []
+        var badRows: [[String: Any]] = []
         var seenIDs = Set<String>()
         for row in legacy {
-            guard let bytes = try? JSONSerialization.data(withJSONObject: row),
-                  let item = try? decoder.decode(SubItem.self, from: bytes),
-                  !item.id.isEmpty, seenIDs.insert(item.id).inserted else {
-                NSLog("AR: 旧记录无法完整校验，保留原始数据，未迁移")
-                return
+            if let bytes = try? JSONSerialization.data(withJSONObject: row),
+               let item = try? decoder.decode(SubItem.self, from: bytes),
+               !item.id.isEmpty, seenIDs.insert(item.id).inserted {
+                if !item.id.hasPrefix("demo:") { items.append(item) }
+            } else {
+                // 解码失败 / 空 id / 重复 id：原行留下，既不整批放弃也不静默丢弃
+                badRows.append(row)
             }
-            if !item.id.hasPrefix("demo:") { items.append(item) }
+        }
+        if !badRows.isEmpty {
+            NSLog("AR: 旧记录坏 \(badRows.count) 行（无法解码/空 id/重复 id），已保留在 state.json 待修复")
+        }
+        guard !items.isEmpty else {
+            NSLog("AR: 旧记录无有效行，原文件保持不变")   // pendingLegacyManualItems 继续兜底
+            return
         }
         do {
             // 原始文件留底，包括未知旧字段；不能先删除manualItems再提交数据库。
@@ -501,7 +684,7 @@ final class Store {
             NSLog("AR: 旧记录备份失败，保留原文件，未迁移")
             return
         }
-        let migrated = db.transaction {
+        let migrated = inTransaction {
             // 数据库提交后JSON清理失败的重试，不覆盖后来修改过的同ID条目。
             let existingIDs = Set(db.loadItems().map { $0.id })
             for item in items where !existingIDs.contains(item.id) {
@@ -514,12 +697,18 @@ final class Store {
             NSLog("AR: 旧记录事务迁移失败，保留原始数据供重试")
             return
         }
-        object.removeValue(forKey: "manualItems")
+        // 好行已入库；坏行仍留在 manualItems 键里（save() 用 pendingLegacyManualItems 原样回写），
+        // 每次启动继续尝试，用户记录不会因为一行脏数据而消失。
+        if badRows.isEmpty {
+            object.removeValue(forKey: "manualItems")
+        } else {
+            object["manualItems"] = badRows
+        }
         do {
             let cleaned = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
             try cleaned.write(to: settingsFileURL, options: .atomic)
-            pendingLegacyManualItems = nil
-            NSLog("AR: 已完整迁移 \(items.count) 条旧记录到 SQLite")
+            pendingLegacyManualItems = badRows.isEmpty ? nil : badRows
+            NSLog("AR: 旧记录迁移完成：成功 \(items.count) 行/保留坏行 \(badRows.count) 行")
         } catch {
             NSLog("AR: 迁移已入库但旧JSON清理失败，保留原始记录供幂等重试")
         }
@@ -561,11 +750,28 @@ final class Store {
 
     // MARK: 手动条目（数据库读写穿透）
 
+    func reminderHours(for id: String) -> Int {
+        reminderHoursByID[id] ?? ReminderTiming.defaultHours
+    }
+
+    /// 仅修改提醒设置，不改到期时间，也不触发周组/伴生窗口的联动。
+    @discardableResult
+    func setReminderHours(_ hours: Int, for id: String) -> Bool {
+        guard !id.isEmpty, (1...ReminderTiming.maxHours).contains(hours),
+              db.setReminderHours(hours, for: id) else { return false }
+        reminderHoursByID[id] = hours
+        dataVersion += 1
+        return true
+    }
+
     /// 测试注入：按 (条目, action) 模拟写入结果；返回 nil = 走真实写入。
     /// action 取值：add / update / add_week / align_reset / align_week
     var upsertInjection: ((_ item: SubItem, _ action: String) -> Bool?)?
 
-    /// 最近一次父条目写成功但关联对齐写失败的证据（"action:id" 列表）
+    /// 最近一次父条目写成功但关联对齐未完成的证据（"action:id" 列表）。
+    /// action 取值：align_reset / align（伴生平移）、align_week（兄弟周条目写失败）、
+    /// align_week:clamped（顺延后会晚于组内最晚轮次，主动不推）、align_week:unidentified
+    /// （名称脱离「·第k/n周」，周序解析不出，整组重排失效）——后两类是「不静默」新增的口径。
     private(set) var lastAlignmentFailures: [String] = []
 
     private let settingsWriteLock = NSLock()
@@ -591,11 +797,24 @@ final class Store {
         return item
     }
 
-    private func upsertManual(_ item: SubItem, alignCompanion: Bool) -> ManualWriteResult {
+    /// - Parameter dropCompanion: 父条目转为周期窗口时，同事务删掉冗余的伴生重置窗口（问题 8：
+    ///   父写成功、伴生删失败会留下双份滚动窗口）。false = 只写父（原行为）。
+    private func upsertManual(_ item: SubItem, alignCompanion: Bool, dropCompanion: Bool = false) -> ManualWriteResult {
         let item = Store.sanitized(item)
         let previous = manualItems.first { $0.id == item.id }
         let action = previous == nil ? "add" : "update"
-        guard write(item, action: action) else { return .parentFailed }
+        let companionID = SubItem.quotaResetId(for: item.id)
+        let hasCompanion = manualItems.contains { $0.id == companionID }
+        let wroteParent: Bool
+        if dropCompanion && hasCompanion {
+            wroteParent = inTransaction {
+                guard write(item, action: action) else { return false }
+                return db.delete(id: companionID, action: "delete")
+            }
+        } else {
+            wroteParent = write(item, action: action)
+        }
+        guard wroteParent else { return .parentFailed }
         var failures: [String] = []
         if alignCompanion, let previous, previous.expiresAt != item.expiresAt,
            var reset = manualItems.first(where: { $0.id == SubItem.quotaResetId(for: item.id) }),
@@ -604,24 +823,43 @@ final class Store {
             if !write(reset, action: "align_reset") { failures.append("align_reset:\(reset.id)") }
         }
         // 已拆分的周提醒在修改某一周后，后续周沿这一次到期时间排列。
-        if let previous, previous.expiresAt != item.expiresAt,
-           let group = item.groupID, let index = item.weekIndex {
-            for var sibling in manualItems where sibling.groupID == group {
-                guard let nextIndex = sibling.weekIndex, nextIndex > index else { continue }
-                let oldExpiry = sibling.expiresAt
-                sibling.expiresAt = item.expiresAt.addingTimeInterval(Double(nextIndex - index) * 7 * 86400)
-                if !write(sibling, action: "align_week") {
-                    failures.append("align_week:\(sibling.id)")
-                    continue   // 兄弟成员本身写失败，其伴生窗口不再平移
+        if let previous, previous.expiresAt != item.expiresAt, let group = item.groupID {
+            let siblings = manualItems.filter { $0.groupID == group }
+            if let index = item.weekIndex {
+                // 组里没有「订阅到期」可查（saveWeeklySplit 只落轮次本身）。轮次满足
+                // 末轮 ≤ 真实到期 < 末轮 + 7 天，所以「末轮 + 7 天」是到期的开区间上界：
+                // 顺延后落到上界之外的尾部条目不再往前推（否则凭空造出订阅到期之后的额度周），
+                // 界内的小幅顺延则照常放行。真修要给组存 plan_expiry 列，见 HANDOFF。
+                let upperBound = siblings.map(\.expiresAt).max()?
+                    .addingTimeInterval(7 * 86400) ?? item.expiresAt
+                for var sibling in siblings {
+                    guard let nextIndex = sibling.weekIndex, nextIndex > index else { continue }
+                    let proposed = item.expiresAt.addingTimeInterval(Double(nextIndex - index) * 7 * 86400)
+                    guard proposed < upperBound else {
+                        failures.append("align_week:clamped:\(sibling.id)")
+                        NSLog("AR: 分周重排被到期上界拦下：\(sibling.name) 顺延后 \(Fmt.absTime(proposed)) 不低于组内末轮+7天 \(Fmt.absTime(upperBound))（即已越过订阅到期），保持原到期")
+                        continue
+                    }
+                    let oldExpiry = sibling.expiresAt
+                    sibling.expiresAt = proposed
+                    if !write(sibling, action: "align_week") {
+                        failures.append("align_week:\(sibling.id)")
+                        continue   // 兄弟成员本身写失败，其伴生窗口不再平移
+                    }
+                    if var reset = manualItems.first(where: { $0.id == "qreset:" + sibling.id }),
+                       reset.resetRule == nil || reset.resetRule == .rolling {
+                        reset.expiresAt = reset.expiresAt.addingTimeInterval(sibling.expiresAt.timeIntervalSince(oldExpiry))
+                        if !write(reset, action: "align_week") { failures.append("align_week:\(reset.id)") }
+                    }
                 }
-                if var reset = manualItems.first(where: { $0.id == "qreset:" + sibling.id }),
-                   reset.resetRule == nil || reset.resetRule == .rolling {
-                    reset.expiresAt = reset.expiresAt.addingTimeInterval(sibling.expiresAt.timeIntervalSince(oldExpiry))
-                    if !write(reset, action: "align_week") { failures.append("align_week:\(reset.id)") }
-                }
+            } else if siblings.count > 1 {
+                // 名称已脱离「·第k/n周」→ 周序解析不出来，整套重排失效。以前静默 return nil，
+                // 用户只看到「改了第一周，后面几周没跟上」；现在留证据（并显式返回三态失败）。
+                failures.append("align_week:unidentified:\(item.id)")
+                NSLog("AR: 周组 \(group) 条目 \(item.id)（\(item.name)）无法识别周序，后续周未重排（名称已脱离「·第k/n周」格式）")
             }
         }
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
         lastAlignmentFailures = failures
         return failures.isEmpty ? .success : .savedWithAlignFailure(failures: failures)
     }
@@ -634,7 +872,7 @@ final class Store {
         for item in items {
             if write(Store.sanitized(item), action: item.groupID != nil ? "add_week" : "add") { written += 1 } else { failed += 1 }
         }
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
         if failed == 0 { return .success }
         return written > 0 ? .partialSaved(written: written, failed: failed) : .parentFailed
     }
@@ -642,17 +880,11 @@ final class Store {
     /// 编辑路径：写入父条目（保留调用方构造的 kind/resetRule/resetParam/purchaseAt，不被推断覆盖），
     /// 并在到期时间变化时同步平移 rolling 伴生窗口（action "align"）。
     /// 日历模式伴生不平移（独立于到期日）；previousExpiry 为 nil 或差值为 0 时不做伴生对齐。
+    /// 条目本身转为周期窗口时，冗余伴生窗口的删除与父写入在**同一次事务**里（问题 8）。
     @discardableResult
     func updateManual(_ item: SubItem, previousExpiry: Date?, now: Date = Date()) -> ManualWriteResult {
-        var result = upsertManual(item, alignCompanion: false)
+        var result = upsertManual(item, alignCompanion: false, dropCompanion: item.kind == .window)
         guard result.saved else { return result }
-        // 条目本身转为周期窗口后，其名下的伴生重置窗口已冗余（双份滚动），移除
-        if item.kind == .window {
-            let cid = SubItem.quotaResetId(for: item.id)
-            if manualItems.contains(where: { $0.id == cid }) {
-                _ = deleteManual(id: cid)   // 内部 bump dataVersion 并回读
-            }
-        }
         guard let previous = previousExpiry else { return result }
         let delta = item.expiresAt.timeIntervalSince(previous)
         guard delta != 0,
@@ -670,7 +902,7 @@ final class Store {
                 break
             }
         }
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
         return result
     }
 
@@ -678,6 +910,9 @@ final class Store {
     /// 重置节奏独立于订阅到期——自首次重置 anchor 起每 7 天一档（anchor + 7k ≤ 订阅到期），
     /// 生成「名称·第k/n周」组条目；重置次数由 anchor 与到期共同决定，最后一轮可能叠不满到期日。
     /// anchor 缺省 = now + 7 天（由表单默认值传入）；replacing = 升级为周组时被替换的原单条。
+    /// 幂等：replacing 条目若已属某个周组，事务内先按旧 groupID **整组删除**再插新组
+    /// ——只删那一条会让旧组残留，重复调用即条目翻倍（问题 2，原先仅靠 UI 拦截）。
+    /// 已过期的轮次不入库（问题 7）：anchor 在过去时只保留 now 之后的轮次，note 说明丢弃了几轮。
     @discardableResult
     func saveWeeklySplit(name: String, vendor: String?, expiry: Date, firstReset anchor: Date,
                          replacing: String? = nil, now: Date = Date()) -> ManualWriteResult {
@@ -688,31 +923,41 @@ final class Store {
         var base = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if base.isEmpty { base = cleanedVendor }
         let span = expiry.timeIntervalSince(anchor)
-        guard span.isFinite, span >= 0, span < 520 * 7 * 86400 else { return .parentFailed }
-        let resets = (0...Int(floor(span / (7 * 86400)))).map {
+        guard span.isFinite, span >= 0,
+              span < Double(Store.maxWeeklySplits) * 7 * 86400 else { return .parentFailed }
+        let allRounds = (0...Int(floor(span / (7 * 86400)))).map {
             anchor.addingTimeInterval(Double($0) * 7 * 86400)
         }
+        // 已过去的轮次入库 = 面板顶部一串「已过期」红条，且用户无法靠滚动追回；只留未来轮次。
+        // 不读 displayHorizonDays：更远的周次仍整组入库，落到展示窗口后才出现。
+        let resets = allRounds.filter { $0 > now }
+        let dropped = allRounds.count - resets.count
+        guard !resets.isEmpty else { return .parentFailed }
         let n = resets.count
         let advice = QuotaAdvice.weeklyPlan(expiry: expiry, firstReset: anchor, now: now).advice
         let gid = UUID().uuidString
-        let members = resets.enumerated().map { k, d -> SubItem in
+        let members = resets.enumerated().map { k, round -> SubItem in
             var v = SubItem.manualDefault(name: "\(base)·第\(k + 1)/\(n)周", vendor: cleanedVendor)
-            v.expiresAt = d
+            v.expiresAt = round
             v.groupID = gid
             v.note = "官方周额度节奏：自 \(Fmt.absTime(anchor)) 每 7 天重置，共 \(n) 轮。" + advice.joined(separator: " ")
+                + (dropped > 0 ? " 已丢弃已过期的前 \(dropped) 轮（\(Fmt.absTime(anchor)) 起至 \(Fmt.absTime(now))）。" : "")
             return v
         }
-        let ok = db.transaction {
+        let ok = inTransaction {
+            if let replacing {
+                // 旧组整组清掉：新组用全新 gid，只删被替换的那一条会让同组兄弟挂在旧 gid 下。
+                // 成员非空时 deleteGroup 返回 0 即删除失败 → 整个事务回滚，不留新旧两组并存。
+                if let oldGroup = manualItems.first(where: { $0.id == replacing })?.groupID,
+                   db.deleteGroup(oldGroup) == 0 { return false }
+                guard db.delete(id: replacing), db.delete(id: SubItem.quotaResetId(for: replacing)) else { return false }
+            }
             for member in members {
                 guard write(member, action: "add_week") else { return false }
             }
-            if let replacing {
-                guard db.delete(id: replacing), db.delete(id: SubItem.quotaResetId(for: replacing)) else { return false }
-            }
             return true
         }
-        manualItems = db.loadItems()
-        if ok { dataVersion += 1 }
+        reloadManualItems()   // 只在读完整时才替换缓存
         return ok ? .success : .parentFailed
     }
 
@@ -831,10 +1076,29 @@ final class Store {
         return (rule: newest.resetRule, param: newest.resetParam, repeatHours: newest.repeatHours)
     }
 
-    /// 实际写入（测试注入缝）：优先走 upsertInjection；成功路径 bump dataVersion
+    /// 实际写入（测试注入缝）：优先走 upsertInjection；成功路径 bump dataVersion。
+    /// 事务内调用时只记账，由 inTransaction 在 COMMIT 成功后统一 bump 一次（问题 9：
+    /// 回滚后版本号仍已增长 → PanelUI 白做一次重建）。
     private func write(_ item: SubItem, action: String) -> Bool {
         let ok = upsertInjection?(item, action) ?? db.upsert(item, action: action)
-        if ok { dataVersion += 1 }
+        if ok { bumpDataVersion() }
+        return ok
+    }
+
+    private func bumpDataVersion() {
+        if transactionDepth > 0 { wroteInsideTransaction = true; return }
+        dataVersion += 1
+    }
+
+    /// 事务包装：整体成功才把 dataVersion 推进一格；失败回滚则版本号一动不动。
+    /// Database.transaction 的 body 返回 false 即 ROLLBACK，这里负责记账与收尾。
+    private func inTransaction(_ body: () -> Bool) -> Bool {
+        transactionDepth += 1
+        let ok = db.transaction(body)
+        transactionDepth -= 1
+        let wrote = wroteInsideTransaction
+        wroteInsideTransaction = false
+        if ok && wrote { dataVersion += 1 }
         return ok
     }
 
@@ -843,7 +1107,7 @@ final class Store {
     func deleteManual(id: String) -> Bool {
         let ok = db.delete(id: id)
         if ok { dataVersion += 1 }
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
         return ok
     }
 
@@ -852,7 +1116,7 @@ final class Store {
         let removedParent = db.delete(id: id)
         let removedCompanion = db.delete(id: SubItem.quotaResetId(for: id))
         if removedParent || removedCompanion { dataVersion += 1 }
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
     }
 
     /// 批量删除手动条目及其派生的周额度重置窗口（清理过期路径使用）
@@ -864,7 +1128,7 @@ final class Store {
             if removedParent || removedCompanion { any = true }
         }
         if any { dataVersion += 1 }
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
     }
 
     /// 删除整组（按周划分），返回删除条数
@@ -872,24 +1136,63 @@ final class Store {
     func deleteGroup(_ groupID: String) -> Int {
         let n = db.deleteGroup(groupID)
         if n > 0 { dataVersion += 1 }
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
         return n
     }
 
     /// 过期处置阈值（天）：过期满 3 天才算「这条死了」。归档与「清理过期」共用同一常量——
     /// 两边阈值不一致，就会出现「手删得掉、自动流程还打算往前滚」的口径裂缝。
+    /// 同时也是 SubItem.isDisplayable 的展示宽限期：一个数字管三处（展示/归档/清理）。
     static let archiveAfterDays: Double = 3
 
-    /// 「清理过期」候选：过期满归档阈值(3天) + 未归档 + 不是还能往前滚的活窗口。
+    /// 面板和设置列表只展示距到期不超过这么多整天的条目。
+    /// 只影响显示判断；更远的周次仍整组留在数据库里，剩余整天数落到窗口后才出现。
+    static let defaultDisplayHorizonDays = 40
+    static let minDisplayHorizonDays = 1
+    static let maxDisplayHorizonDays = 3650
+
+    /// <1 → 1，>3650 → 3650，其余原样。
+    static func clampDisplayHorizonDays(_ raw: Int) -> Int {
+        if raw < minDisplayHorizonDays { return minDisplayHorizonDays }
+        if raw > maxDisplayHorizonDays { return maxDisplayHorizonDays }
+        return raw
+    }
+
+    /// 当前展示窗口（天）。读时再钳一次，state 里残留的越界值也不会漏进显示判断。
+    var displayHorizonDays: Int { Store.clampDisplayHorizonDays(state.displayHorizonDays) }
+
+    func setDisplayHorizonDays(_ raw: Int) {
+        state.displayHorizonDays = Store.clampDisplayHorizonDays(raw)
+        save()
+    }
+
+    /// 分周轮次上限（≈10 年）：saveWeeklySplit 的拒绝阈值与 splitWeekly / QuotaAdvice.weeklyPlan
+    /// 的生成上限同一个常量。原先只有 saveWeeklySplit 有 520，另两处用 Int(ceil(极端值))——
+    /// 极端时间戳直接 trap（Double 转 Int 越界）。
+    static let maxWeeklySplits = 520
+
+    /// 「清理过期」候选：过期满归档阈值(3天) + 未归档 + **确实不再滚动的一次性到期**。
     /// 原实现只看 `expiresAt < now-24h`，既不看 archivedAt 也不看 kind，等于把
     /// ① 刚过期一天、按策略还该留两天的条目，② 用户仍在消耗的 .window 额度周期
     /// 一起删掉（数据丢失）。归档条目走 purgeArchived（30 天）或设置后台逐条删除，不在此重复。
     /// 官方来源条目不清理（与 archiveExpiredSubscriptions 的 source 判定一致）。
+    /// 「窗口却算不出下一轮」（repeatHours 为 nil、calendarMonth 而 reset_param 为 NULL、
+    /// DB 里未知 reset_rule 读回静默变 nil）不等于「死了」：这类残缺窗口**只归档不删除**，
+    /// 否则用户手录的活额度会被 deleteManualsWithDerived 永久抹掉（问题 5）。
     func expiredManualItems(olderThan days: Double = Store.archiveAfterDays, now: Date = Date()) -> [SubItem] {
+        guard !dbReadIncomplete else {
+            NSLog("AR: 库尚未补读完整，本轮不给出「清理过期」名单（按残缺集合删数据会丢记录）")
+            return []
+        }
         let cutoff = now.addingTimeInterval(-days * 86400)
         return manualItems.filter { item in
             guard item.source == "manual", item.archivedAt == nil, item.expiresAt < cutoff else { return false }
-            return item.nextRoll(after: now) == nil   // 滚得动的窗口 = 活额度，删不得
+            guard item.nextRoll(after: now) == nil else { return false }   // 滚得动的窗口 = 活额度，删不得
+            if item.hasUnresolvableRoll(after: now) {
+                NSLog("AR: 窗口条目 \(item.id)（\(item.name)）算不出下一轮重置（规则残缺：repeatHours/日历参数缺失），只归档不删除")
+                return false
+            }
+            return true   // 一次性到期（订阅）：过了宽限期确实没有下一轮，可删
         }
     }
 
@@ -898,7 +1201,7 @@ final class Store {
         var removed = 0
         ids.forEach { if db.delete(id: $0, action: "clean_expired") { removed += 1 } }
         if removed > 0 { dataVersion += 1 }
-        manualItems = db.loadItems()
+        reloadManualItems()   // 只在读完整时才替换缓存
         return removed
     }
 
@@ -906,12 +1209,17 @@ final class Store {
     /// rolling：按 repeatHours 整倍数前滚（相位保持）；
     /// 日历模型：跳到下一个未来节点（离线跨周期不累积——错过的日历节点不会补）
     func rollManualWindows(now: Date = Date()) {
+        // 面板按小时闸到这里，顺带把上一次的半读补回来（补成完整前，归档/清理都不会跑）
+        if dbReadIncomplete { reloadManualItems() }
         var rolled = false
         for i in manualItems.indices {
             guard manualItems[i].expiresAt <= now,
                   let next = manualItems[i].nextRoll(after: now) else { continue }
             var updated = manualItems[i]
             updated.expiresAt = next
+            // 新一轮 = 满额度：usedPercent 必须清空，否则新窗口一上来就显示上一轮的「已用 60%」。
+            // 官方条目的 usedPercent 由 Readers 每轮重算，不经此路径，置 nil 无损。
+            updated.usedPercent = nil
             if write(updated, action: "roll") {
                 manualItems[i] = updated
                 rolled = true
@@ -920,15 +1228,26 @@ final class Store {
         if rolled { manualItems.sort { $0.expiresAt < $1.expiresAt } }
     }
 
-    /// 生命周期：手动订阅过期超过 days 天且未归档 → 打上归档时间（面板隐藏，保留期内可清理）。
+    /// 生命周期：过期超过 days 天、且这一轮之后不会再有下一轮 → 打上归档时间（面板隐藏，保留期内可清理）。
     /// 伴生重置窗口随父一并归档——订阅已死，「下次重置」不再有意义，否则成孤儿窗口常驻面板。
     /// days 缺省即「清理过期」的阈值：条目先被归档、之后只能逐条删或等 purgeArchived，两者不会互相抢活。
+    /// 判据与 expiredManualItems / SubItem.isDisplayable 同一条（问题 4）：
+    /// 旧实现硬写 `kind == .subscription && source == "manual"`，窗口条目与官方 auto:* 条目
+    /// archivedAt 恒 nil → 永远排在全列表第一位，面板与胶囊长期挂着「已过期」。
     func archiveExpiredSubscriptions(olderThan days: Double = Store.archiveAfterDays, now: Date = Date()) {
+        guard !dbReadIncomplete else {
+            NSLog("AR: 库尚未补读完整，本轮跳过自动归档")
+            return
+        }
         let cutoff = now.addingTimeInterval(-days * 86400)
         for i in manualItems.indices {
             let it = manualItems[i]
-            guard it.kind == .subscription, it.source == "manual",
-                  it.archivedAt == nil, it.expiresAt < cutoff else { continue }
+            guard it.archivedAt == nil, it.expiresAt < cutoff,
+                  it.nextRoll(after: now) == nil else { continue }   // 还能滚的是活额度，不归档
+            if it.hasUnresolvableRoll(after: now) {
+                // 规则残缺的窗口：归档保留（可从设置后台看到并修规则），清理路径不会删它
+                NSLog("AR: 归档窗口条目 \(it.id)（\(it.name)）：过期后算不出下一轮重置（重置规则残缺）")
+            }
             var archived = it
             archived.archivedAt = now
             if write(archived, action: "archive") {
@@ -948,6 +1267,10 @@ final class Store {
 
     /// 生命周期：归档超过 days 天的条目连伴生窗口一起清除
     func purgeArchived(olderThan days: Double = 30, now: Date = Date()) {
+        guard !dbReadIncomplete else {
+            NSLog("AR: 库尚未补读完整，本轮跳过归档清除（不可凭残缺集合删数据）")
+            return
+        }
         let cutoff = now.addingTimeInterval(-days * 86400)
         let ids = manualItems
             .filter { if let a = $0.archivedAt { return a < cutoff }; return false }
@@ -988,8 +1311,15 @@ enum Fmt {
         return f
     }()
 
+    /// 时间戳合法性守卫：expires_at 是 SQLite REAL，被外部改坏成 NaN / 1e308 时
+    /// `Int(sec)` 会直接 trap 掉整个进程（Fatal error: Double value cannot be converted to Int）。
+    private static func saneSeconds(_ sec: TimeInterval) -> Bool {
+        sec.isFinite && abs(sec) < 1e15
+    }
+
     static func countdown(until: Date, now: Date = Date()) -> String {
         let sec = until.timeIntervalSince(now)
+        guard saneSeconds(sec) else { return "时间异常" }
         if sec <= -86400 { return "已过期 \(-Int(sec) / 86400)天+" }
         if sec <= 0 { return sec > -60 ? "已过期" : "已过期\(-Int(sec) / 60)分" }
         let s = Int(sec)
@@ -1002,6 +1332,7 @@ enum Fmt {
     /// 紧凑格式：药丸 / 表格用
     static func countdownShort(until: Date, now: Date = Date()) -> String {
         let sec = until.timeIntervalSince(now)
+        guard saneSeconds(sec) else { return "时间异常" }
         if sec <= 0 { return "已过期" }
         let s = Int(sec)
         if s >= 86400 * 10 { return "\(s / 86400)天" }
@@ -1037,32 +1368,78 @@ enum QuotaAdvice {
     /// - 首轮短于 7 天（官方锚定）→「这几天快点用」
     /// - 末轮短于 7 天（叠不满订阅到期）→ 白嫖天数 + 续买建议（再等 leftover 天，避免新窗口重叠）
     /// - 末轮重置即到期 → 该轮额度基本来不及用
+    /// 天数口径（问题 7）：「只剩 N 天」一律 floor——向上取整把 2.1 天说成 3 天，
+    /// 用户按 3 天规划就会在最后一天发现不够；不足 1 天直接说小时，不说「只有 1 天」。
     static func weeklyPlan(expiry: Date, firstReset: Date, now: Date = Date()) -> Plan {
         guard firstReset <= expiry else {
             return Plan(resets: [], advice: ["首次重置需早于（或等于）订阅到期"])
         }
+        guard expiry.timeIntervalSince(firstReset).isFinite else { return Plan(resets: [], advice: ["时间戳异常，无法排期"]) }
         let week = 7.0 * 86400
         var resets: [Date] = []
         var t = firstReset
-        while t <= expiry {
+        while t <= expiry, resets.count < Store.maxWeeklySplits {   // 轮次上限：极端到期日不铺满内存
             resets.append(t)
-            t = t.addingTimeInterval(week)
+            guard let next = optionalAdd(week, to: t) else { break }
+            t = next
         }
         var advice: [String] = []
         if firstReset > now {
-            let days = Int(ceil(firstReset.timeIntervalSince(now) / 86400))
-            if days < 7 { advice.append("首轮只有 \(days) 天：这几天快点用") }
+            let seconds = firstReset.timeIntervalSince(now)
+            let days = flooredDays(seconds)
+            if days >= 7 {
+                // 首轮就是整周或更长，正常节奏，无需催
+            } else if days >= 1 {
+                advice.append("首轮只有 \(days) 天：这几天快点用")
+            } else {
+                let rawHours = hoursOf(seconds)          // 已 floor，非有限值兜底 0
+                let hours = Int(min(max(rawHours, 1), 1e6))
+                advice.append("首轮只剩 \(hours) 小时：这几天快点用")
+            }
         }
-        let last = resets[resets.count - 1]
-        let tailDays = expiry.timeIntervalSince(last) / 86400
-        let leftover = Int(ceil(last.addingTimeInterval(week).timeIntervalSince(expiry) / 86400))
-        let until = Fmt.shortDate(last.addingTimeInterval(week))
+        guard let last = resets.last else { return Plan(resets: resets, advice: advice) }
+        guard let nextAfterLast = optionalAdd(week, to: last) else {
+            return Plan(resets: resets, advice: advice)
+        }
+        let tailDays = flooredDays(expiry.timeIntervalSince(last))
+        let leftover = ceiledDays(nextAfterLast.timeIntervalSince(expiry))
+        let until = Fmt.shortDate(nextAfterLast)
         if tailDays >= 1 {
-            let d = Int(tailDays.rounded(.up))
-            advice.append("末轮只剩 \(d) 天（\(d) 天白嫖一周额度）；续买建议再等 \(leftover) 天（至 \(until)）再买，避免额度重叠")
+            advice.append("末轮只剩 \(tailDays) 天（\(tailDays) 天白嫖一周额度）；续买建议再等 \(leftover) 天（至 \(until)）再买，避免额度重叠")
         } else {
             advice.append("末轮重置即到期（该轮额度几乎来不及用）；续买建议等 \(leftover) 天（至 \(until)）本轮额度耗尽后再买")
         }
         return Plan(resets: resets, advice: advice)
+    }
+
+    // MARK: 排期取整辅助
+
+    private static func optionalAdd(_ seconds: TimeInterval, to date: Date) -> Date? {
+        let result = date.addingTimeInterval(seconds)
+        guard result.timeIntervalSince1970.isFinite else { return nil }
+        return result
+    }
+
+    private static func hoursOf(_ interval: TimeInterval) -> Double {
+        interval.isFinite ? floor(interval / 3600) : 0
+    }
+
+    /// 先把 0.001 天（≈86 秒）以内的抖动归一：否则「正好 2 天」会因为多算了几毫秒被读成 1 天，
+    /// 「再等 6 天」会因为 6.0000001 被 ceil 成 7 天（同一串文案在测试里就会飘）。
+    private static func normalizedDays(_ interval: TimeInterval) -> Double? {
+        guard interval.isFinite, interval > 0 else { return nil }
+        let scaled = interval / 86400 * 1000
+        guard scaled.isFinite, abs(scaled) < 1e15 else { return nil }
+        return scaled.rounded() / 1000
+    }
+
+    /// 「只剩 N 天」→ floor
+    private static func flooredDays(_ interval: TimeInterval) -> Int {
+        Int(floor(normalizedDays(interval) ?? 0))
+    }
+
+    /// 「再等 N 天」→ ceil（等待时间是下限，说少了会让人提前购买造成额度重叠），并夹在轮次上限内
+    private static func ceiledDays(_ interval: TimeInterval) -> Int {
+        Int(min(ceil(normalizedDays(interval) ?? 0), Double(Store.maxWeeklySplits)))
     }
 }

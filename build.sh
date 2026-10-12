@@ -5,7 +5,8 @@ cd "$(dirname "$0")"
 
 APP_NAME="AI到期提醒"
 BUNDLE_ID="com.sijunting.ai-expiry-reminder"
-BUILD_DIR="build"
+VERSION="1.4.0"
+BUILD_DIR="${AR_BUILD_DIR:-build}"
 APP="$BUILD_DIR/$APP_NAME.app"
 
 rm -rf "$APP"
@@ -25,15 +26,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>AIReminder</string>
+    <key>CFBundleName</key><string>$APP_NAME</string>
     <key>CFBundleDisplayName</key><string>$APP_NAME</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-    <key>CFBundleVersion</key><string>1.1.2</string>
-    <key>CFBundleShortVersionString</key><string>1.1.2</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleExecutable</key><string>AIReminder</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>LSUIElement</key><true/>
+    <key>LSUIElement</key><false/>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>NSHumanReadableCopyright</key><string>Personal tool</string>
 </dict>
@@ -43,10 +44,13 @@ PLIST
 echo "==> swiftc 编译中…"
 # 系统液态玻璃（NSGlassEffectView / NSBezelStyleGlass）是 macOS 26 的公开 API，
 # 编译下限就定在 26.0，不再保留磨砂玻璃退路。
-swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos26.0" -module-cache-path "$BUILD_DIR/module-cache" \
-    Sources/Models.swift Sources/Database.swift Sources/Readers.swift Sources/Motion.swift Sources/Vendors.swift Sources/CalendarPicker.swift Sources/PanelUI.swift Sources/Settings.swift Sources/Resident.swift Sources/main.swift \
-    -o "$APP/Contents/MacOS/AIReminder"
-
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+for ARCH in arm64 x86_64; do
+    swiftc -O -swift-version 5 -target "$ARCH-apple-macos26.0" -module-cache-path "$BUILD_DIR/module-cache-$ARCH" \
+        Sources/Models.swift Sources/Database.swift Sources/Readers.swift Sources/Motion.swift Sources/Vendors.swift Sources/CalendarPicker.swift Sources/PanelUI.swift Sources/Settings.swift Sources/Resident.swift Sources/main.swift \
+        -o "$BUILD_DIR/AIReminder-$ARCH"
+done
+lipo -create "$BUILD_DIR/AIReminder-arm64" "$BUILD_DIR/AIReminder-x86_64" -output "$APP/Contents/MacOS/AIReminder"
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP"
 
 echo "==> 完成：$APP ($(du -sh "$APP" | cut -f1))"

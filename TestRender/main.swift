@@ -52,10 +52,13 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         Motion.enabled = false   // 截图与断言需要同步最终态
+        Store.shared.state.panelAutoCollapse = true  // 既有自动收起场景继续验证；手动模式另测。
+        // 音效和悬停上浮都认这个开关，测试保持静音、无动画
         // ⑦ 首用引导：必须在播种前以空库走一次真实 showPanel——
         //    新用户第一眼应该看到自动展开的「暂无条目，点 ＋ 添加」，而不是裸 ⏳ 药丸
         pc = PanelController(loadOfficialData: false)
         pc.showPanel()
+        topmostTests()
         let glassHost = pc.debugContentView?.window?.contentView as? GlassSurface
         precondition(glassHost?.contentView === pc.debugContentView,
                      "文字和交互必须由玻璃 contentView 承载，不能放在不保证层级的兄弟视图")
@@ -90,6 +93,7 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
                                           usedPercent: 100, groupID: nil))
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            self.windowStackTest()
             // 1) 展开态（仅隔离演示条目）
             self.pc.debugSetExpanded(true)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -136,6 +140,79 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 行为断言：智能保存管线（自动命名/伴生窗口/编辑平移/归档）+ 极简表单失败保留输入
+    private func topmostTests() {
+        let window = pc.debugContentView!.window!
+        // 启动后模拟系统撤下窗口，心跳应恢复；主动隐藏仍有自己的出口。
+        window.orderOut(nil)
+        pc.tick()
+        precondition(window.isVisible, "非用户隐藏必须在一次心跳内恢复")
+        let keyBefore = NSApp.keyWindow
+        pc.restoreToTopRight()
+        let screen = window.screen!
+        precondition(window.frame.size == NSSize(width: 54, height: 18)
+                     && abs(window.frame.maxX - (screen.visibleFrame.maxX - 6)) < 1
+                     && abs(window.frame.maxY - (screen.visibleFrame.maxY - 8)) < 1,
+                     "恢复入口应在当前操作屏右上角显示原尺寸胶囊")
+        precondition(NSApp.keyWindow === keyBefore, "置顶恢复不得抢键盘焦点")
+        precondition(window.collectionBehavior.contains([.canJoinAllApplications, .canJoinAllSpaces,
+                                                        .fullScreenAuxiliary, .stationary]) && !window.canHide,
+                     "覆盖层应加入桌面/全屏/台前调度，并避免随应用隐藏")
+        window.setFrameOrigin(NSPoint(x: 100000, y: 100000))
+        NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: NSApp)
+        precondition(NSScreen.screens.contains { $0.visibleFrame.contains(window.frame) },
+                     "显示器布局变化后离屏窗口应回到现有屏幕内")
+
+        print("PASS: 意外隐藏自愈、右上角归位、焦点保持、跨桌面策略")
+        precondition(pc.debugStatusItem!.isVisible
+                     && pc.debugStatusItem!.length == NSStatusItem.variableLength
+                     && pc.debugStatusItem!.button!.title == "到期"
+                     && pc.debugStatusItem!.button!.image != nil
+                     && pc.debugStatusItem!.menu != nil,
+                     "菜单栏入口必须请求显示沙漏和到期文字；实际呈现需在正式菜单栏复核")
+
+        let menu = NSMenu()
+        pc.menuWillOpen(menu)
+        for _ in 0..<31 { pc.tick() }
+        precondition(window.level == .floating, "菜单跟踪时心跳不得把覆盖层压到菜单上")
+        pc.menuWillOpen(menu)
+        pc.menuDidClose(menu)
+        precondition(window.level == .floating && pc.debugCollapseGate.suppressed,
+                     "嵌套菜单还有一层时应保持交互抑制")
+        pc.menuDidClose(menu)
+        precondition(window.level == FloatingWindowPolicy.panelLevel && !pc.debugCollapseGate.suppressed,
+                     "菜单完全关闭后立即恢复置顶和自动收起")
+        pc.perform(NSSelectorFromString("hideClicked"))
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        precondition(!window.isVisible, "主动隐藏应跨桌面仍被尊重")
+        pc.restoreToTopRight()
+        pc.debugSetExpanded(true)
+        pc.perform(NSSelectorFromString("collapseClicked"))
+        precondition(window.isVisible && window.frame.size == NSSize(width: 54, height: 18),
+                     "顶部收起按钮应保留可见胶囊")
+        print("PASS: 嵌套菜单层级恢复、主动隐藏保持、关闭改为收起")
+        pc.debugSetExpanded(true)  // 还原空库首启引导，交给后续既有断言。
+    }
+
+    // applicationDidFinishLaunching 返回后，WindowServer 才完成首次挂窗。
+    private func windowStackTest() {
+        let window = pc.debugContentView!.window!
+        let blocker = NSWindow(contentRect: window.frame.insetBy(dx: -20, dy: -20),
+                               styleMask: [.borderless], backing: .buffered, defer: false)
+        blocker.isReleasedWhenClosed = false
+        blocker.level = NSWindow.Level(rawValue: 102)
+        blocker.orderFrontRegardless()
+        window.displayIfNeeded()
+        blocker.displayIfNeeded()
+        CATransaction.flush()
+        let stack = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+        let panelIndex = stack.firstIndex { ($0[kCGWindowNumber as String] as? Int) == window.windowNumber }
+        let blockerIndex = stack.firstIndex { ($0[kCGWindowNumber as String] as? Int) == blocker.windowNumber }
+        precondition(panelIndex != nil && blockerIndex != nil && panelIndex! < blockerIndex!,
+                     "WindowServer 必须确认置顶面板压过后打开的系统覆盖层级窗口")
+        blocker.orderOut(nil)
+        print("PASS: WindowServer 确认真实窗口压过后打开的覆盖层窗口")
+    }
+
     private func behaviorTests(now: Date) {
         // ── 智能管线：名称可识别、供应商留空 → 反向识别厂商 + 自动伴生重置窗口 ──
         precondition(Store.shared.saveInferred(name: "Codex 额度", vendor: nil,
@@ -265,8 +342,14 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         zeroEditor.window!.orderFrontRegardless()
         calendarButton.performClick(nil)
         precondition(CalendarPickerController.shared.isVisible, "日期按钮必须打开月历")
+        precondition(CalendarPickerController.shared.debugPanel!.level > pc.debugContentView!.window!.level,
+                     "日历必须位于置顶面板上方")
         precondition(CalendarPickerController.shared.debugTap(year: 2026, month: 10, day: 8),
                      "月历日期格必须可点击")
+        precondition(CalendarPickerController.shared.isVisible
+                     && CalendarPickerController.shared.debugSelected != nil,
+                     "点日只标记选中，必须等「确定」才提交（先看后确认）")
+        precondition(CalendarPickerController.shared.debugConfirm(), "确定按钮必须存在且可点")
         let chosen = Calendar.current.dateComponents([.day, .hour, .minute], from: expiryField.date)
         precondition(!CalendarPickerController.shared.isVisible && chosen.day == 8
                      && chosen.hour == 0 && chosen.minute == 7
@@ -454,10 +537,94 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         manualWindow.repeatHours = 720
         precondition(RowView.detailTooltip(qresetProbe, now: now).contains("下次重置"), "周重置伴生窗口 tooltip 应称下次重置")
         precondition(!RowView.detailTooltip(manualWindow, now: now).contains("下次重置"), "手动通用窗口 tooltip 不得称下次重置")
-        precondition(!RowView.detailTooltip(qresetProbe, now: now).contains("提醒"), "提醒功能已删除，tooltip 不得再出现提醒字样")
+        precondition(RowView.detailTooltip(qresetProbe, now: now).contains("提前 5 小时"), "tooltip 应说明默认提前量与右键入口")
         print("PASS: tooltip 按额度重置语义精确区分")
 
         panelAnchorTests()
+        controlTests()
+    }
+
+    private func controlTests() {
+        let floating = pc.debugContentView!.window!
+        let existingWindows = Set(NSApp.windows.map(\.windowNumber))
+        let anchor = NSPoint(x: floating.frame.maxX, y: floating.frame.maxY)
+        pc.showControls()
+        let controls = pc.debugControls
+        func click(_ id: String) {
+            let button = descendants(pc.debugContentView!).compactMap { $0 as? NSButton }
+                .first { $0.accessibilityIdentifier() == id }!
+            button.performClick(nil)
+        }
+        func action(_ id: String) {
+            let item = controls.moreMenu.items.first { $0.accessibilityIdentifier() == id }!
+            precondition(NSApp.sendAction(item.action!, to: item.target, from: item))
+        }
+        floating.contentView!.layoutSubtreeIfNeeded()
+        precondition(floating.isVisible && floating.frame.width == 240 && controls.window === floating,
+                     "控制区必须在原胶囊窗口内展开")
+        precondition(Set(NSApp.windows.map(\.windowNumber)) == existingWindows,
+                     "展开控制区不得创建另一个窗口")
+        precondition(abs(floating.frame.maxX - anchor.x) < 1,
+                     "打开控制区应沿用胶囊右缘，不得挪到屏幕中央")
+        precondition(!controls.isHidden && controls.bounds.height == CapsuleControlsView.height,
+                     "紧凑控制区必须可见")
+        let buttons = descendants(controls).compactMap { $0 as? HoverEffectButton }
+        precondition(buttons.count == 4 && Set(buttons.map { $0.frame.minY }).count == 1,
+                     "控制功能必须排在同一行")
+        precondition(buttons.allSatisfy { controls.bounds.contains($0.frame) },
+                     "控制按钮不得溢出胶囊面板")
+        controls.autoCollapseButton.performClick(nil)
+        precondition(!Store.shared.state.panelAutoCollapse && !Store().state.panelAutoCollapse,
+                     "手动模式必须跨重启保存")
+        PanelController.debugCursorOverride = NSPoint(x: -100000, y: -100000)
+        for _ in 0..<12 { pc.debugHeartbeatResync() }
+        PanelController.debugCursorOverride = nil
+        precondition(!pc.debugCollapseScheduled && floating.frame.width == 240,
+                     "手动模式移开鼠标不得重挂自动收起")
+        let controlFrame = floating.frame
+        click("capsuleControlsToggle")
+        precondition(controls.isHidden && floating.frame.height <= controlFrame.height,
+                     "齿轮应在同一窗口内收起控制区")
+        click("capsuleControlsToggle")
+        precondition(!controls.isHidden && floating.frame == controlFrame,
+                     "再次打开控制区应恢复原有位置与高度")
+        action("panelControlHide")
+        precondition(!floating.isVisible, "隐藏必须隐藏整个胶囊面板")
+        pc.showControls()
+        precondition(floating.isVisible && controls.window === floating && !controls.isHidden,
+                     "主动打开应用必须恢复原胶囊内的控制区")
+        let oldStatusItem = pc.debugStatusItem!
+        let desktopFrame = floating.frame
+        UserDefaults.standard.set(false, forKey: "NSStatusItem Visible AIReminderStatusItem")
+        UserDefaults.standard.set(100000, forKey: "NSStatusItem Preferred Position AIReminderStatusItem")
+        action("panelControlRestoreMenuBar")
+        precondition(pc.debugStatusItem !== oldStatusItem && pc.debugStatusItem!.isVisible
+                     && pc.debugStatusItem!.button!.image != nil,
+                     "恢复顶部菜单栏应重新注册沙漏入口")
+        precondition(UserDefaults.standard.integer(forKey: "NSStatusItem Preferred Position AIReminderStatusItem") == 519,
+                     "恢复顶部菜单栏必须复位本应用原先保存的位置")
+        precondition(floating.frame == desktopFrame && !Store.shared.state.panelCollapsed,
+                     "恢复顶部菜单栏不得移动或收起当前面板")
+        if let anotherScreen = NSScreen.screens.first(where: { $0 !== floating.screen }) {
+            let frame = anotherScreen.visibleFrame
+            floating.setFrameOrigin(NSPoint(x: frame.midX - 120, y: frame.maxY - floating.frame.height - 8))
+            click("panelControlRestore")
+            precondition(anotherScreen.visibleFrame.contains(floating.frame)
+                         && abs(floating.frame.maxX - (frame.maxX - 6)) < 1,
+                         "归位应留在胶囊所在显示器")
+        }
+        pc.showControls()
+        snapshot(floating.contentView!, path: "build/render/panel_controls.png")
+        click("panelControlCollapse")
+        precondition(floating.isVisible && floating.frame.size == NSSize(width: 54, height: 18)
+                     && controls.isHidden,
+                     "收起必须让列表与控制区一起回到54×18胶囊")
+        pc.pillClicked()
+        precondition(floating.isVisible && controls.isHidden && controls.window === floating,
+                     "点击胶囊应恢复列表，齿轮可再次打开同窗控制区")
+        pc.showControls()
+        click("panelControlCollapse")
+        print("PASS: 胶囊同窗控制区、单行动作、齿轮开关、隐藏恢复、原位收起、多屏归位与手动模式")
     }
 
     /// AUDIT-2026-09-29 高影响问题：屏幕中部拖放的药丸一点就跳到屏幕右缘， chosen 位置丢失。
@@ -521,6 +688,11 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         // ④ 悬停记账：展开后光标仍在面板内 → 不许挂自动收起计时器；resize 引发的假
         //    mouseExited 同样不许挂（旧行为：面板 8 秒后从鼠标底下收走）；光标真离开 → 必须挂
         //    （旧行为：跳到右缘后既没 enter 也没 exit，面板永远卡着不收）。
+        // 前面为截 panel_expanded.png 打开的内联编辑卡必须先关掉：编辑期间
+        // scheduleAutoCollapse 有意不挂 8 秒表（本轮新行为），带着它跑这段会让
+        // 「不许挂」的两条假通过、「必须挂」的那条假失败。
+        pc.debugHideInlineEditor()
+        precondition(pc.debugCollapseGate.editingId == nil, "④ 前置：内联编辑卡应已关闭")
         guard let container = pc.debugContentView as? PanelContainerView else {
             preconditionFailure("ANCHOR: contentView 不是 PanelContainerView")
         }
@@ -536,6 +708,7 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         precondition(!pc.debugCollapseScheduled, "光标仍在面板内的假 mouseExited 不得挂计时器（回归：8 秒后从鼠标底下收起）")
         PanelController.debugCursorOverride = NSPoint(x: pw.frame.minX - 120, y: pw.frame.minY - 120)
         container.onMouseExit?()
+        print("ANCHOR: 光标离开后 gate=\(pc.debugCollapseGate)")
         precondition(pc.debugCollapseScheduled, "光标真正离开面板后必须挂上自动收起计时器")
         PanelController.debugCursorOverride = NSPoint(x: pw.frame.minX + 20, y: pw.frame.minY + 20)
         container.onMouseEnter?()
@@ -574,7 +747,7 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         pw.setFrameOrigin(capTop)
         for i in 1...40 {
             var it = SubItem.manualDefault(name: "填充行\(String(format: "%02d", i))", vendor: "其他")
-            it.expiresAt = Date().addingTimeInterval(TimeInterval(86400 * (i + 1)))
+            it.expiresAt = Date().addingTimeInterval(TimeInterval(i) * 20 * 3600) // 20 小时～800 小时，均 ≤ 34 天
             Store.shared.upsertManual(it)
         }
         pc.applyCollapsed(false)   // 数据有变强制重建展开（同时把滚动复位到顶）
@@ -642,6 +815,41 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         precondition(!pc.debugRefreshIndicatorOn, "⑦ 刷新结束 ⟳ 应恢复")
         print("PASS: 右键菜单挂在事件宿主上可达且动作生效，⟳ 刷新有置灰/恢复反馈")
 
+        let reminderRow = RowView()
+        var reminderProbe = SubItem.manualDefault(name: "提前提醒 UI 探针")
+        reminderProbe.expiresAt = Date().addingTimeInterval(10 * 86400)
+        reminderRow.configure(reminderProbe, now: Date())
+        var selectedReminderID: String?
+        reminderRow.onReminder = { selectedReminderID = $0.id }
+        let reminderEvent = NSEvent.mouseEvent(with: .rightMouseDown, location: .zero, modifierFlags: [], timestamp: 0,
+                                             windowNumber: win7.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let reminderMenu = reminderRow.menu(for: reminderEvent)!
+        precondition(reminderMenu.items[0].title == "提前 5 小时", "行右键显示该条当前提前量")
+        reminderMenu.performActionForItem(at: 1)
+        precondition(selectedReminderID == reminderProbe.id, "行右键入口必须选中该行 id")
+        let reminderView = ReminderTimingView(item: reminderProbe, hours: 51)
+        precondition(reminderView.daysField.stringValue == "2" && reminderView.hoursField.stringValue == "3",
+                     "提醒设置按天/小时回填")
+        reminderView.hoursField.stringValue = "24"
+        precondition(reminderView.validHours == nil, "提醒表单拒绝 24 小时输入")
+        reminderView.daysField.stringValue = "0"
+        reminderView.hoursField.stringValue = "0"
+        precondition(reminderView.validHours == nil, "提醒表单拒绝总提前量为 0")
+        reminderView.perform(NSSelectorFromString("resetDefault"))
+        precondition(reminderView.validHours == 5, "提醒表单恢复默认 5 小时")
+        reminderView.daysField.stringValue = "2"
+        reminderView.hoursField.stringValue = "3"
+        reminderView.refreshPreview()
+        snapshot(reminderView, path: "build/render/reminder_timing.png")
+        let reminderController = ReminderTimingController(item: reminderProbe, hours: 51)
+        precondition(reminderController.window?.contentView is GlassSurface, "提醒窗口应使用同主面板的系统液态玻璃宿主")
+        precondition(reminderController.window!.level > pc.debugContentView!.window!.level,
+                     "提前提醒设置窗口不得被置顶面板遮住")
+        precondition(!reminderController.editor.daysField.drawsBackground && !reminderController.editor.hoursField.drawsBackground,
+                     "天/小时输入框不得保留不透明系统底色")
+        snapshot(reminderController.window!.contentView!, path: "build/render/reminder_glass_window.png")
+        print("PASS: 单条右键提前提醒入口、天/小时回填、非法输入拦截与默认恢复")
+
         // ⑧ 编辑卡滚入视口：点视口下部的行时，卡片可能整体落在折叠区（用户像「点了没反应」），
         //    打开后必须自动平移进可视范围。
         pc.debugSetExpanded(true)
@@ -702,11 +910,172 @@ final class TestDelegate: NSObject, NSApplicationDelegate {
         precondition(checkedRows > 0, "⑨ 前置：应能检查到带副标题的行")
         precondition(overlapped == 0, "⑨ \(overlapped)/\(checkedRows) 行的副标题压到了删除按钮")
         print("PASS: 副标题止于 ✕ 之前（\(checkedRows) 行）")
+
+        // ── 展示窗口：80 天的条目留在库里，面板和设置表都不排出来 ──
+        var far = SubItem.manualDefault(name: "八十天后", vendor: "其他")
+        far.expiresAt = Date().addingTimeInterval(80 * 86400)
+        Store.shared.upsertManual(far)
+        var soon = SubItem.manualDefault(name: "十天后", vendor: "其他")
+        soon.expiresAt = Date().addingTimeInterval(10 * 86400)
+        Store.shared.upsertManual(soon)
+        pc.applyCollapsed(false)
+        let rowNames = descendants(pc.debugContentView!).compactMap { ($0 as? RowView)?.item?.name }
+        precondition(rowNames.contains("十天后"),
+                     "面板行应出现「十天后」，实际：\(rowNames.joined(separator: "、"))")
+        precondition(!rowNames.contains("八十天后"),
+                     "面板行不得出现「八十天后」，实际：\(rowNames.joined(separator: "、"))")
+        precondition(Store.shared.manualItems.contains { $0.name == "八十天后" },
+                     "「八十天后」必须仍在库里，只是不展示")
+        pc.openSettingsWindow()
+        func settingsTable(in window: NSWindow?) -> NSTableView? {
+            guard let content = window?.contentView else { return nil }
+            return descendants(content).compactMap { $0 as? NSTableView }.first
+        }
+        // 前面截图另开过一个设置窗，表格可能是旧的；刚 orderFront 的这一扇才是本次数据。
+        let frontSettings = NSApp.orderedWindows.first { settingsTable(in: $0) != nil }
+        guard let table = settingsTable(in: frontSettings) else {
+            preconditionFailure("openSettingsWindow 之后，从窗口 contentView 递归找不到 NSTableView")
+        }
+        guard let dataSource = table.dataSource else {
+            preconditionFailure("设置表格没有 dataSource，无法读每行 objectValue")
+        }
+        var tableLines: [String] = []
+        for row in 0..<table.numberOfRows {
+            var cells: [String] = []
+            for col in table.tableColumns {
+                if let value = dataSource.tableView?(table, objectValueFor: col, row: row) {
+                    cells.append(String(describing: value))
+                }
+            }
+            tableLines.append(cells.joined(separator: "\t"))
+        }
+        let tableText = tableLines.joined(separator: "\n")
+        let tableHead = String(tableText.prefix(80))
+        precondition(tableText.contains("十天后"),
+                     "设置表格应有「十天后」，行数 \(table.numberOfRows)，前 80 字：\(tableHead)")
+        precondition(!tableText.contains("八十天后"),
+                     "设置表格不得出现「八十天后」，行数 \(table.numberOfRows)，前 80 字：\(tableHead)")
+        print("PASS: 80 天条目留在库里，面板和设置表只显示 40 天内")
+
+        // ── 展示天数可改：15 天不显示 20 天条目；非法输入不覆盖已保存的天数 ──
+        guard let horizonWindow = frontSettings, let horizonRoot = horizonWindow.contentView else {
+            preconditionFailure("openSettingsWindow 之后没有设置窗，无法找 displayHorizonField")
+        }
+        guard let horizonField = descendants(horizonRoot).compactMap({ $0 as? NSTextField })
+            .first(where: { $0.identifier?.rawValue == "displayHorizonField" }) else {
+            let title = horizonWindow.title.isEmpty ? "无标题" : horizonWindow.title
+            let ident = horizonWindow.identifier?.rawValue ?? "无 identifier"
+            let banner = descendants(horizonRoot).compactMap { $0 as? NSTextField }
+                .first { $0.stringValue.contains("设置后台") }?.stringValue ?? "无「设置后台」文案"
+            preconditionFailure("在设置窗 windowNumber=\(horizonWindow.windowNumber) title=\(title) identifier=\(ident) 文案=\(banner) 的 contentView 里找不到 identifier 为 displayHorizonField 的 NSTextField")
+        }
+        guard let horizonController = table.dataSource as? NSObject else {
+            preconditionFailure("设置表格 dataSource 不是 NSObject，无法调用 horizonEdited（窗 windowNumber=\(horizonWindow.windowNumber)）")
+        }
+        // 名称列精确匹配：「二十天后」含有子串「十天后」，不能用整表文本 contains。
+        func settingsNames(_ tableView: NSTableView) -> [String] {
+            guard let source = tableView.dataSource else {
+                preconditionFailure("设置表格没有 dataSource，无法读每行 objectValue")
+            }
+            guard let nameCol = tableView.tableColumns.first(where: { $0.identifier.rawValue == "name" }) else {
+                preconditionFailure("设置表格没有 name 列，无法核对条目名")
+            }
+            var names: [String] = []
+            for row in 0..<tableView.numberOfRows {
+                if let value = source.tableView?(tableView, objectValueFor: nameCol, row: row) {
+                    names.append(String(describing: value))
+                }
+            }
+            return names
+        }
+        func commitHorizon(_ text: String) {
+            horizonField.stringValue = text
+            _ = horizonController.perform(NSSelectorFromString("horizonEdited"))
+        }
+        commitHorizon("15")
+        let namesAt15 = settingsNames(table)
+        precondition(namesAt15.contains("十天后"),
+                     "15 天窗口仍应显示「十天后」，实际：\(namesAt15.joined(separator: "、"))")
+        precondition(!namesAt15.contains("八十天后"),
+                     "15 天窗口不得显示「八十天后」，实际：\(namesAt15.joined(separator: "、"))")
+        var twentyDay = SubItem.manualDefault(name: "二十天后", vendor: "其他")
+        twentyDay.expiresAt = Date().addingTimeInterval(20 * 86400)
+        Store.shared.upsertManual(twentyDay)
+        // upsert 不刷新设置表（表只在 horizonEdited 和 1 秒 ticker 里重载）。天数没变时再送一次 15。
+        commitHorizon("15")
+        let namesFiltered = settingsNames(table)
+        let filteredList = namesFiltered.joined(separator: "、")
+        precondition(namesFiltered.contains("十天后"),
+                     "15 天窗口应有「十天后」，实际：\(filteredList)")
+        precondition(!namesFiltered.contains("二十天后"),
+                     "15 天窗口不得出现「二十天后」，实际：\(filteredList)")
+        precondition(!namesFiltered.contains("八十天后"),
+                     "15 天窗口不得出现「八十天后」，实际：\(filteredList)")
+        precondition(Store.shared.manualItems.contains { $0.name == "二十天后" },
+                     "「二十天后」必须仍在库里，只是不展示")
+        precondition(Store.shared.manualItems.contains { $0.name == "八十天后" },
+                     "「八十天后」必须仍在库里，只是不展示")
+        commitHorizon("abc")
+        precondition(horizonField.stringValue == "15",
+                     "非法输入不改已保存的天数，字段应回到 15，实际「\(horizonField.stringValue)」")
+        precondition(Store.shared.displayHorizonDays == 15,
+                     "非法输入后 displayHorizonDays 应仍为 15，实际 \(Store.shared.displayHorizonDays)")
+        commitHorizon("40")
+        let restoredDays = Store.shared.displayHorizonDays
+        precondition(restoredDays == 40,
+                     "恢复后 displayHorizonDays 应为 40，实际 \(restoredDays)")
+        let namesRestored = settingsNames(table)
+        precondition(namesRestored.contains("二十天后"),
+                     "40 天窗口应重新显示「二十天后」，实际：\(namesRestored.joined(separator: "、"))")
+        print("PASS: 展示天数可改，非法输入保持 15，恢复后天数 \(restoredDays)")
+
+        // ── 长排期预览必须折行，不得把编辑窗口拉成一条横贯屏幕的长条（不保存）──
+        // 日期行 + 快捷按钮 layout 之后大约 509 宽，所以不能拿初始的 430 当上限。
+        // 560 是 contentMaxSize：再宽就是排期文字把窗口撑开了。
+        var longDraft = SubItem.manualDefault(name: "长排期", vendor: "其他")
+        longDraft.expiresAt = Date().addingTimeInterval(300 * 86400)
+        let longEditor = EditorSheetController(item: longDraft, isNew: true)
+        let longParent = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 20, height: 20),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+        longParent.beginSheet(longEditor.window!)
+        let longPopup = descendants(longEditor.window!.contentView!).compactMap { $0 as? NSPopUpButton }.first!
+        longPopup.selectItem(at: 1)   // 订阅 · 周额度重置（第k/n周）
+        let longFirst = descendants(longEditor.window!.contentView!)
+            .compactMap { $0 as? DateTextField }.first { $0.accessibilityIdentifier() == "firstResetField" }!
+        let longDF = DateFormatter()
+        longDF.dateFormat = "yyyy/MM/dd HH:mm"
+        longDF.timeZone = .current
+        longFirst.setText(longDF.string(from: Date().addingTimeInterval(7 * 86400)))
+        longEditor.perform(NSSelectorFromString("inputChanged"))
+        longEditor.window!.contentView!.layoutSubtreeIfNeeded()
+        snapshot(longEditor.window!.contentView!, path: "build/render/editor-long-schedule.png")
+        let previewLabels = descendants(longEditor.window!.contentView!).compactMap { $0 as? NSTextField }
+        guard let preview = previewLabels.first(where: { $0.stringValue.hasPrefix("排期共") }) else {
+            preconditionFailure("找不到以「排期共」开头的预览标签")
+        }
+        let previewHead = String(preview.stringValue.prefix(80))
+        let contentW = longEditor.window!.contentView!.frame.width
+        precondition(contentW <= 560,
+                     "长排期不得把编辑窗口拉宽，实际宽 \(contentW)，预览：\(previewHead)")
+        precondition(preview.stringValue.contains("\n"),
+                     "周排期预览必须折行，实际宽 \(contentW)，预览：\(previewHead)")
+        precondition(preview.frame.width <= contentW - 40,
+                     "排期预览必须留在列内，实际宽 \(preview.frame.width)，窗口 \(contentW)，预览：\(previewHead)")
+        precondition((preview.cell as? NSTextFieldCell)?.wraps == true,
+                     "排期预览必须允许折行，实际宽 \(preview.frame.width)，预览：\(previewHead)")
+        print("PASS: 长排期预览折行，编辑窗口宽 \(contentW)")
+        // 这张表单不保存，sheet 会一直挂着。不收掉的话 NSApp.terminate 退不出去。
+        if let sheet = longEditor.window {
+            longParent.endSheet(sheet)
+            sheet.orderOut(nil)
+        }
+        longParent.orderOut(nil)
     }
 }
 
 // 渲染测试会写入演示记录；裸跑二进制时必须在接触 Store 前拒绝正式数据目录。
 setvbuf(stdout, nil, _IONBF, 0)   // 断言 trap 时不得丢失已打印的进度
+setvbuf(stderr, nil, _IONBF, 0)
 let testEnvironment = ProcessInfo.processInfo.environment
 guard let isolatedRoot = testEnvironment["AR_DATA_DIR"], !isolatedRoot.isEmpty else {
     fputs("TestRender 必须通过 test_render.sh 在隔离数据目录运行\n", stderr)

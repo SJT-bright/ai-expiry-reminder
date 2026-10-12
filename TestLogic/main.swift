@@ -6,9 +6,11 @@ func date(_ text: String) -> Date {
     f.dateFormat = "yyyy-MM-dd HH:mm"
     return f.date(from: text)!
 }
+var failures: [String] = []
 func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
-    guard condition() else { fatalError(message) }
-    print("PASS: \(message)")
+    // 汇总失败而不是 fatalError：一次跑完才能看清整批改了什么，逐条裁决是不是预期变更
+    if condition() { print("PASS: \(message)") }
+    else { print("FAIL: \(message)"); failures.append(message) }
 }
 let store = Store()
 var reset = SubItem.manualDefault(name: "周重置")
@@ -22,7 +24,8 @@ store.rollManualWindows(now: date("2026-09-18 15:53"))
 expect(store.manualItems.first!.expiresAt == date("2026-09-25 15:53"), "到期边界沿原日期加七天")
 store.rollManualWindows(now: date("2026-10-07 20:00"))
 expect(store.manualItems.first!.expiresAt == date("2026-10-09 15:53"), "跨多周离线仍保留15:53和星期五")
-expect(Store().manualItems.first!.expiresAt == date("2026-10-09 15:53"), "持久化重载不改变重置时间")
+// Store 初始化会按真实今天补滚；此处只核验磁盘重载，避免历史测试锚点随日期失效。
+expect(Database(dir: store.dir).loadItems().first { $0.id == reset.id }!.expiresAt == date("2026-10-09 15:53"), "持久化重载不改变重置时间")
 var parent = SubItem.manualDefault(name: "ZCode")
 parent.expiresAt = date("2026-10-04 00:00")
 let weeks = parent.splitWeekly(from: date("2026-09-06 18:00"))
@@ -463,9 +466,12 @@ expect(store.manualItems.first { $0.id == SubItem.quotaResetId(for: convert.id) 
 
 // ── saveWeeklySplit：官方周额度节奏（第k/n周，独立于订阅到期） ──
 // 用户场景：9/17 买 Grok，订阅到期 10/17，首次重置 9/20 → 每周一档共 4 轮，10/18 叠不满被排除
+// 必须显式传 now：不传时已过期的轮次会被丢弃（新规则），硬编码 2026 锚点在真实今天必然只剩 1 轮。
 let splitExpiry = date("2026-10-17 00:00")
+let splitNow = date("2026-09-19 12:00")
 expect(store.saveWeeklySplit(name: "Grok 月卡", vendor: "xAI", expiry: splitExpiry,
-                             firstReset: date("2026-09-20 00:00")).saved, "saveWeeklySplit：写入成功")
+                             firstReset: date("2026-09-20 00:00"), now: splitNow).saved,
+       "saveWeeklySplit：写入成功")
 let splitMembers = store.manualItems
     .filter { $0.name.hasPrefix("Grok 月卡·第") }
     .sorted { $0.expiresAt < $1.expiresAt }
@@ -480,7 +486,8 @@ var upgrade = SubItem.manualDefault(name: "升级探针", vendor: "xAI")
 upgrade.expiresAt = date("2026-11-30 00:00")
 store.upsertManual(upgrade)
 expect(store.saveWeeklySplit(name: "升级探针", vendor: "xAI", expiry: date("2026-11-30 00:00"),
-                             firstReset: date("2026-10-20 00:00"), replacing: upgrade.id).saved,
+                             firstReset: date("2026-10-20 00:00"), replacing: upgrade.id,
+                             now: date("2026-10-19 12:00")).saved,
        "saveWeeklySplit：升级写入成功")
 expect(store.manualItems.first { $0.id == upgrade.id } == nil, "saveWeeklySplit：replacing 原单条被移除")
 expect(store.manualItems.contains { $0.name == "升级探针·第1/6周" }, "saveWeeklySplit：升级后生成周组（10/20 起共 6 轮）")
@@ -493,8 +500,10 @@ let advicePlan = QuotaAdvice.weeklyPlan(expiry: date("2026-10-26 00:00"),
                                         firstReset: date("2026-09-25 00:00"), now: adviceNow)
 expect(advicePlan.resets.count == 5 && advicePlan.resets.last == date("2026-10-23 00:00"),
        "QuotaAdvice：自动填补全部重置时点（9/25 起共 5 轮，末轮 10/23）")
-expect(advicePlan.advice.contains { $0.contains("快点用") && $0.contains("3 天") },
-       "QuotaAdvice：首轮只有 3 天 → 提示快点用")
+// 9/22 12:00 → 9/25 00:00 是 2.5 天：「只剩 N 天」按 floor 口径说 2 天。
+// 少报让人快点用；按旧的 ceil 说 3 天，用户按 3 天规划会在最后一天发现不够。
+expect(advicePlan.advice.contains { $0.contains("快点用") && $0.contains("2 天") },
+       "QuotaAdvice：首轮 2.5 天 → floor 说只有 2 天并提示快点用")
 expect(advicePlan.advice.contains { $0.contains("白嫖") && $0.contains("3 天") && $0.contains("再等 4 天") },
        "QuotaAdvice：末轮 3 天白嫖一周额度 → 续买建议再等 4 天")
 let zeroTail = QuotaAdvice.weeklyPlan(expiry: date("2026-10-30 00:00"),
@@ -625,3 +634,100 @@ expect(!checks.manualItems.contains { $0.name.hasPrefix(original.name + "·第")
 checks.upsertInjection = nil
 expect(checks.saveWeeklySplit(name: "过长分周", vendor: nil, expiry: fixedNow, firstReset: ancient) == .parentFailed,
        "超长分周拒绝生成大量记录")
+
+// ── 展示窗口：floor(剩余秒/86400) ≤ displayHorizonDays；更远的周次仍整组入库 ──
+// 边界用固定 now，不用会漂移的当前时间。测完恢复 40，避免短窗口弄失败周入库。
+let now = date("2026-10-05 12:00")
+Store.shared.setDisplayHorizonDays(40)
+expect(Store.shared.displayHorizonDays == 40, "展示窗口：检查 Store.shared.displayHorizonDays == 40")
+var horizon40 = SubItem.manualDefault(name: "展示窗口40天")
+horizon40.expiresAt = now.addingTimeInterval(40 * 86400)
+expect(horizon40.isWithinDisplayHorizon(now: now), "展示窗口：正好 40 天在窗口内")
+var horizon40h = SubItem.manualDefault(name: "展示窗口40天23小时")
+horizon40h.expiresAt = now.addingTimeInterval(40 * 86400 + 23 * 3600)
+expect(horizon40h.isWithinDisplayHorizon(now: now), "展示窗口：40 天 + 23 小时 floor 后仍是 40，在窗口内")
+var horizon41 = SubItem.manualDefault(name: "展示窗口41天")
+horizon41.expiresAt = now.addingTimeInterval(41 * 86400)
+expect(!horizon41.isWithinDisplayHorizon(now: now), "展示窗口：正好 41 天不在窗口内")
+var horizonExpired = SubItem.manualDefault(name: "展示窗口已过期")
+horizonExpired.expiresAt = now.addingTimeInterval(-86400)
+expect(horizonExpired.isWithinDisplayHorizon(now: now), "展示窗口：已过期 1 天仍在窗口内")
+var horizonNaN = SubItem.manualDefault(name: "展示窗口非有限")
+horizonNaN.expiresAt = Date(timeIntervalSince1970: .nan)
+expect(!horizonNaN.isWithinDisplayHorizon(now: now), "展示窗口：非有限到期时间不展示")
+Store.shared.setDisplayHorizonDays(10)
+var horizon10 = SubItem.manualDefault(name: "展示窗口10天")
+horizon10.expiresAt = now.addingTimeInterval(10 * 86400)
+expect(horizon10.isWithinDisplayHorizon(now: now), "展示窗口：正好 10 天在窗口内")
+var horizon10h = SubItem.manualDefault(name: "展示窗口10天23小时")
+horizon10h.expiresAt = now.addingTimeInterval(10 * 86400 + 23 * 3600)
+expect(horizon10h.isWithinDisplayHorizon(now: now), "展示窗口：10 天 + 23 小时 floor 后仍是 10，在窗口内")
+var horizon11 = SubItem.manualDefault(name: "展示窗口11天")
+horizon11.expiresAt = now.addingTimeInterval(11 * 86400)
+expect(!horizon11.isWithinDisplayHorizon(now: now), "展示窗口：正好 11 天不在窗口内")
+Store.shared.setDisplayHorizonDays(0)
+expect(Store.shared.displayHorizonDays == 1, "展示窗口：setDisplayHorizonDays(0) 后 displayHorizonDays == 1")
+Store.shared.setDisplayHorizonDays(99999)
+expect(Store.shared.displayHorizonDays == 3650, "展示窗口：setDisplayHorizonDays(99999) 后 displayHorizonDays == 3650")
+Store.shared.setDisplayHorizonDays(40)
+expect(store.saveWeeklySplit(name: "远周", vendor: "Google",
+                             expiry: now.addingTimeInterval(200 * 86400),
+                             firstReset: now.addingTimeInterval(7 * 86400),
+                             now: now).saved == true,
+       "远周入库：写入成功")
+let farWeeks = store.manualItems.filter { $0.name.hasPrefix("远周·第") }
+let farWeeksShown = farWeeks.filter { $0.isWithinDisplayHorizon(now: now) }
+expect(farWeeks.count > farWeeksShown.count,
+       "远周入库：名称以「远周·第」开头的条数多于展示窗口内的条数")
+expect(farWeeks.contains { !$0.isWithinDisplayHorizon(now: now) },
+       "远周入库：至少一条不在展示窗口内")
+expect(farWeeks.contains { $0.isWithinDisplayHorizon(now: now) },
+       "远周入库：至少一条在展示窗口内")
+
+// ── 每条记录的提前提醒：旧记录默认、独立保存、重载与触发边界 ──
+expect(ReminderTiming.hours(days: "2", hours: "3") == 51, "提醒输入：2 天 3 小时合为 51 小时")
+for values in [("0", "0"), ("-1", "5"), ("1", "24"), ("1.5", "0"), ("", "5"), ("3651", "0"), ("999999999999999999999999", "0")] {
+    expect(ReminderTiming.hours(days: values.0, hours: values.1) == nil, "提醒输入：拒绝非法值 \(values)")
+}
+var reminderItem = SubItem.manualDefault(name: "提醒独立保存探针")
+reminderItem.expiresAt = Date().addingTimeInterval(60 * 86400)
+expect(store.upsertManual(reminderItem).saved, "提醒：建立隔离记录")
+let reminderSnapshot = store.manualItems
+expect(store.reminderHours(for: reminderItem.id) == 5, "提醒：旧记录默认提前 5 小时")
+expect(store.setReminderHours(51, for: reminderItem.id), "提醒：保存 2 天 3 小时")
+expect(store.manualItems == reminderSnapshot, "提醒：所有原记录的到期/周组/内容逐字段不变")
+expect(Store().reminderHours(for: reminderItem.id) == 51, "提醒：重新打开数据库后仍为 51 小时")
+expect(store.reminderHours(for: "another-item") == 5, "提醒：其他条目仍是默认 5 小时")
+expect(store.setReminderHours(24, for: "auto:codex:test"), "提醒：官方条目也可独立保存")
+expect(Store().reminderHours(for: "auto:codex:test") == 24, "提醒：官方偏好重载保留")
+let failedReminderVersion = badStore.dataVersion
+expect(!badStore.setReminderHours(24, for: probe.id), "提醒：数据库不可写时如实失败")
+expect(badStore.reminderHours(for: probe.id) == 5 && badStore.dataVersion == failedReminderVersion,
+       "提醒：写失败不改变内存设置和版本")
+let reminderNow = Date()
+reminderItem.expiresAt = reminderNow.addingTimeInterval(51 * 3600)
+expect(ReminderTiming.isDue(reminderItem, hours: 51, now: reminderNow), "提醒：提前量边界立即触发")
+expect(!ReminderTiming.isDue(reminderItem, hours: 51, now: reminderNow.addingTimeInterval(-1)), "提醒：边界前 1 秒不触发")
+expect(!ReminderTiming.isDue(reminderItem, hours: 5, now: reminderNow), "提醒：不再固定用 5 小时判断")
+reminderItem.expiresAt = reminderNow
+expect(!ReminderTiming.isDue(reminderItem, hours: 51, now: reminderNow), "提醒：已经到期不补弹")
+reminderItem.expiresAt = reminderNow.addingTimeInterval(3600)
+reminderItem.archivedAt = reminderNow
+expect(!ReminderTiming.isDue(reminderItem, hours: 51, now: reminderNow), "提醒：归档条目不弹")
+reminderItem.archivedAt = nil
+reminderItem.kind = .window
+reminderItem.repeatHours = 5
+expect(!ReminderTiming.isDue(reminderItem, hours: 5, now: reminderNow), "提醒：默认不轰炸 5 小时短窗口")
+expect(ReminderTiming.isDue(reminderItem, hours: 2, now: reminderNow), "提醒：5 小时窗口可改成提前 2 小时")
+reminderItem.repeatHours = 168
+expect(!ReminderTiming.allowsAlert(reminderItem, hours: 168), "提醒：提前量不能覆盖整个滚动周期")
+expect(store.setReminderHours(5, for: reminderItem.id) && Store().reminderHours(for: reminderItem.id) == 5,
+       "提醒：恢复默认 5 小时并持久保存")
+
+if failures.isEmpty {
+    print("逻辑回归全部通过")
+} else {
+    print("FAILURES(\(failures.count)):")
+    failures.forEach { print("  ✗ \($0)") }
+    exit(1)
+}

@@ -1,0 +1,84 @@
+name: Windows desktop build and acceptance
+on:
+  push:
+    branches: [main, 'codex/ai-reminder-cross-platform-*']
+    tags: ['v*']
+    paths: ['Windows/**', '.github/workflows/windows-release.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+            unpacked: win-unpacked
+          - runner: windows-11-arm
+            arch: arm64
+            unpacked: win-arm64-unpacked
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: Windows
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: Windows/package-lock.json
+      - name: Install pinned dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Domain and recovery regressions
+        run: npm test
+      - name: Download Electron runtime
+        run: npx --no-install install-electron
+      - name: Native source UI acceptance
+        run: node test/native-smoke.cjs
+      - name: Build installer and portable ZIP
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run dist -- --${{ matrix.arch }}
+      - name: Native packaged executable acceptance
+        run: |
+          $env:AR_SMOKE_OUTPUT = 'packaged-smoke-results'
+          node test/native-smoke.cjs 'dist/${{ matrix.unpacked }}/AI到期提醒.exe'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Installer acceptance and data preservation
+        run: |
+          $installer = (Get-ChildItem dist/*-Setup.exe | Select-Object -First 1).FullName
+          $target = Join-Path $env:RUNNER_TEMP 'AI提醒 安装验收 #'
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$target" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Installer failed' }
+          $exe = Join-Path $target 'AI到期提醒.exe'
+          if (-not (Test-Path $exe)) { throw 'Installed executable is missing' }
+          $env:AR_SMOKE_OUTPUT = 'installed-smoke-results'
+          node test/native-smoke.cjs $exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $data = Join-Path $env:APPDATA 'AI到期提醒'
+          New-Item -ItemType Directory -Path $data -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $data 'uninstall-preservation-marker.txt') -Value 'synthetic acceptance'
+          $uninstaller = Get-ChildItem -LiteralPath $target -Filter '*Uninstall*.exe' | Select-Object -First 1
+          if (-not $uninstaller) { $uninstaller = Get-ChildItem -LiteralPath $target -Filter '*卸载*.exe' | Select-Object -First 1 }
+          if (-not $uninstaller) { throw 'Uninstaller missing' }
+          Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -Wait
+          if (-not (Test-Path -LiteralPath (Join-Path $data 'uninstall-preservation-marker.txt'))) { throw 'Uninstall removed application data' }
+      - name: Checksums
+        run: |
+          Get-ChildItem dist/*.exe, dist/*.zip | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content -Encoding utf8NoBOM "dist/SHA256SUMS-Windows-${{ matrix.arch }}.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            Windows/dist/*.exe
+            Windows/dist/*.zip
+            Windows/dist/SHA256SUMS-*.txt
+            Windows/*smoke-results/**
+          retention-days: 14

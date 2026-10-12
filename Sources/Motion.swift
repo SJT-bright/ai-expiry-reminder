@@ -2,11 +2,20 @@ import AppKit
 import QuartzCore
 
 // MARK: - 悬停浮起按钮
-// 鼠标移入：轻微放大浮起 + 高亮；移出：落下还原。全局统一交互语言。
+// 鼠标移入：缓慢垂直上浮 + 高亮（不缩放）；移出：落下还原。边框磨圆胶囊裁切。
 
 class HoverEffectButton: NSButton {
-    /// 悬停放大档：1.12 + 更亮的高亮层——「触感更强」的手感基准，全局按钮统一
-    var hoverScale: CGFloat = 1.12
+    /// 兼容旧调用点；悬停不再放大（图层默认 anchorPoint=(0,0)，缩放会左右错位）
+    var hoverScale: CGFloat = 1
+    /// 悬停中标记
+    private(set) var isHovered = false
+    /// 静止时的胶囊底色。悬停高亮结束后必须回到这个颜色，不能清成透明。
+    var restFill: NSColor? {
+        didSet {
+            wantsLayer = true
+            if !isHovered { layer?.backgroundColor = restFill?.cgColor }
+        }
+    }
     /// 芯片按钮内边距：isBordered=false 的固有尺寸默认只有文字大小，加上它才有可点的面
     var contentPadding = NSEdgeInsets() {
         didSet { invalidateIntrinsicContentSize() }
@@ -21,25 +30,47 @@ class HoverEffectButton: NSButton {
                       height: max(s.height + p.top + p.bottom, 20))
     }
 
+    /// 胶囊裁切：圆角半径取短边一半，masksToBounds 把描边/高亮收进胶囊。
+    /// 系统按钮格子会自己铺一层不透明底，暗色窗上会把白字盖没，这里清掉。
+    override func layout() {
+        super.layout()
+        wantsLayer = true
+        (cell as? NSButtonCell)?.backgroundColor = .clear
+        layer?.cornerRadius = min(bounds.height, bounds.width) / 2
+        layer?.masksToBounds = true
+        if !isHovered { layer?.backgroundColor = restFill?.cgColor }
+    }
+
+    /// 点击音前置到按下瞬间；动作仍在 mouseUp 经 NSButton 标准跟踪触发（拖出取消语义不变）。
+    /// 不再 bounce 缩放：同样会因 anchorPoint=(0,0) 横向错位。
+    override func mouseDown(with event: NSEvent) {
+        if isEnabled { Motion.playTap() }
+        super.mouseDown(with: event)
+    }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
-        if tracking == nil {
-            let ta = NSTrackingArea(rect: bounds,
-                                    options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                    owner: self, userInfo: nil)
-            addTrackingArea(ta)
-            tracking = ta
-        }
+        if let tracking { removeTrackingArea(tracking) }
+        let ta = NSTrackingArea(rect: bounds,
+                                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                owner: self, userInfo: nil)
+        addTrackingArea(ta)
+        tracking = ta
     }
 
     override func mouseEntered(with event: NSEvent) {
-        Motion.float(self, on: true, scale: hoverScale, lift: 1.0)
-        Motion.highlight(self, on: true, color: NSColor(white: 1, alpha: 0.14))
+        guard isEnabled else { return }
+        isHovered = true
+        Motion.float(self, on: true, lift: 3.5)
+        Motion.highlight(self, on: true, color: NSColor(white: 1, alpha: 0.18),
+                         rest: restFill ?? .clear)
     }
 
     override func mouseExited(with event: NSEvent) {
+        isHovered = false
         Motion.float(self, on: false)
-        Motion.highlight(self, on: false)
+        Motion.highlight(self, on: false, color: NSColor(white: 1, alpha: 0.18),
+                         rest: restFill ?? .clear)
     }
 }
 
@@ -60,6 +91,12 @@ enum Motion {
     private static var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
+    /// 统一判定：动效总开关 + 系统减弱动态效果。任何「先摆起始态再动画」的代码
+    /// 都必须用它做前置判断，Motion 关闭时直接落最终态（测试截图依赖这一点）。
+    static var canAnimate: Bool { enabled && !reduceMotion }
+    /// 系统 Tink；找不到再读 /System/Library/Sounds/Tink.aiff。首次真正播放时才加载。
+    private static let tapSound: NSSound? = NSSound(named: "Tink")
+        ?? NSSound(contentsOfFile: "/System/Library/Sounds/Tink.aiff", byReference: true)
 
     /// 渐入（窗口）：只走透明度，几何与滤镜都不碰
     static func reveal(_ window: NSWindow, duration: TimeInterval = revealDuration) {
@@ -86,11 +123,18 @@ enum Motion {
     /// 编辑卡在自己的最终位置向屏幕前浮出：轻微放大并淡入，没有垂直位移。
     /// 只动画新卡的呈现层；模型层保持最终状态，重复点击不会把整列重播。
     static func popForward(_ view: NSView) {
-        guard enabled, !reduceMotion else { return }
+        popIn(view)
+    }
+
+    /// 通用「向前浮出」：scale 0.96→1 + 可选垂直位移（dy<0 = 从下方浮起）+ 可选淡入。
+    /// 位移走呈现层、模型层直接落最终态，重复触发不会从原点重播。
+    /// 缩放必须补偿 anchorPoint=(0,0)：托管图层以左下为锚，直接缩放会横向错位。
+    static func popIn(_ view: NSView, duration: TimeInterval = 0.22,
+                      startScale: CGFloat = 0.96, dy: CGFloat = 0,
+                      startAlpha: CGFloat? = 0.65) {
+        guard canAnimate else { return }
         view.wantsLayer = true
         guard let layer = view.layer else { return }
-        let duration: TimeInterval = 0.22
-        let startScale: CGFloat = 0.96
         let timing = CAMediaTimingFunction(name: .easeOut)
         let scale = CABasicAnimation(keyPath: "transform.scale")
         scale.fromValue = startScale
@@ -103,19 +147,95 @@ enum Motion {
         x.duration = duration
         x.timingFunction = timing
         let y = CABasicAnimation(keyPath: "transform.translation.y")
-        y.fromValue = layer.bounds.height * (1 - startScale) / 2
+        y.fromValue = layer.bounds.height * (1 - startScale) / 2 + dy
         y.toValue = 0
         y.duration = duration
         y.timingFunction = timing
-        let opacity = CABasicAnimation(keyPath: "opacity")
-        opacity.fromValue = 0.65
-        opacity.toValue = 1.0
-        opacity.duration = duration
-        opacity.timingFunction = timing
         layer.add(scale, forKey: "popForward.scale")
         layer.add(x, forKey: "popForward.x")
         layer.add(y, forKey: "popForward.y")
-        layer.add(opacity, forKey: "popForward.opacity")
+        if let startAlpha {
+            let opacity = CABasicAnimation(keyPath: "opacity")
+            opacity.fromValue = startAlpha
+            opacity.toValue = 1.0
+            opacity.duration = duration
+            opacity.timingFunction = timing
+            layer.add(opacity, forKey: "popForward.opacity")
+        }
+    }
+
+    /// 页面级滑入（月历翻页、控制区展开）：从 (dx, dy) 偏移滑到原位并淡入。
+    /// 位移走呈现层；透明度走 AppKit alphaValue 体系（与视图 alpha 不打架）。
+    static func slideIn(_ view: NSView, dx: CGFloat = 0, dy: CGFloat = 0,
+                        duration: TimeInterval = 0.26, startAlpha: CGFloat = 0.25) {
+        guard canAnimate else { return }
+        view.wantsLayer = true
+        if let layer = view.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
+            let timing = CAMediaTimingFunction(name: .easeInEaseOut)
+            func add(_ keyPath: String, _ from: CGFloat, _ key: String) {
+                let a = CABasicAnimation(keyPath: keyPath)
+                a.fromValue = from
+                a.toValue = 0
+                a.duration = duration
+                a.timingFunction = timing
+                layer.add(a, forKey: key)
+            }
+            if dx != 0 { add("transform.translation.x", dx, "motionSlideIn.x") }
+            if dy != 0 { add("transform.translation.y", dy, "motionSlideIn.y") }
+        }
+        view.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            view.animator().alphaValue = 1
+        }
+    }
+
+    /// 页面级滑出（旧页退场）：滑向 (dx, dy) 并淡出；completion 后由调用方移除视图。
+    /// Motion 关闭时同步回调 completion，调用方据此立即拆除，行为与无动画一致。
+    static func slideOut(_ view: NSView, dx: CGFloat = 0, dy: CGFloat = 0,
+                         duration: TimeInterval = 0.26, completion: (() -> Void)? = nil) {
+        guard canAnimate else { completion?(); return }
+        view.wantsLayer = true
+        if let layer = view.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DTranslate(CATransform3DIdentity, dx, dy, 0)
+            CATransaction.commit()
+            let timing = CAMediaTimingFunction(name: .easeInEaseOut)
+            func add(_ keyPath: String, _ to: CGFloat, _ key: String) {
+                let a = CABasicAnimation(keyPath: keyPath)
+                a.fromValue = 0
+                a.toValue = to
+                a.duration = duration
+                a.timingFunction = timing
+                layer.add(a, forKey: key)
+            }
+            if dx != 0 { add("transform.translation.x", dx, "motionSlideOut.x") }
+            if dy != 0 { add("transform.translation.y", dy, "motionSlideOut.y") }
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            view.animator().alphaValue = 0
+        }, completionHandler: completion)
+    }
+
+    /// 淡出：动画到全透明后回调，隐藏与恢复 alpha 由调用方决定（调用方可能要按
+    /// 当前状态决定是否真的藏——快速往返时 completion 可能已经过期）。
+    /// Motion 关闭时同步回调，最终态（全透明）由调用方落地。
+    static func fadeOut(_ view: NSView, duration: TimeInterval = 0.15,
+                        completion: (() -> Void)? = nil) {
+        guard canAnimate else { completion?(); return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            view.animator().alphaValue = 0
+        }, completionHandler: completion)
     }
 
     /// 轻量淡入（无模糊，适合行级小元素）；delay>0 时先隐藏再延迟入场
@@ -154,59 +274,141 @@ enum Motion {
         })
     }
 
-    /// 按压反馈：轻微降透明度
+    /// 按压反馈：只做 0.12s 透明度 0.75↔1。不再 float 缩放，避免行点击横向错位。
     static func press(_ view: NSView, pressed: Bool) {
         guard enabled, !reduceMotion else { return }
-        view.alphaValue = pressed ? 0.7 : 1
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.12
+            view.animator().alphaValue = pressed ? 0.75 : 1
+        }
     }
 
-    /// 悬停浮起（柔和波浪）：阻尼弹簧过渡——轻柔上浮、一丝波浪回落再静止；离开时柔和落下。
-    /// 以视图中心为锚轻微放大 + 垂直上浮；NSView 托管图层默认 anchorPoint=(0,0)，需平移补偿防斜漂。
-    static func float(_ view: NSView, on: Bool, scale: CGFloat = 1.02, lift: CGFloat = 1.5) {
+    /// 点击反馈：不再改 transform（缩放同样会横向错位）。极短透明度闪一下。`to` 保留兼容，忽略。
+    static func bounce(_ view: NSView, to scale: CGFloat = 1) {
+        _ = scale
         guard enabled, !reduceMotion else { return }
-        view.wantsLayer = true
-        guard let layer = view.layer, layer.bounds.width > 0, layer.bounds.height > 0 else { return }
-        let cx = layer.bounds.width / 2
-        let cy = layer.bounds.height / 2
-        let s: CGFloat = on ? scale : 1
-        let dy: CGFloat = on ? lift : 0            // 非翻转视图图层 y 轴向上 → +y 即垂直上浮
-        var t = CGAffineTransform(translationX: cx, y: cy)
-        t = t.scaledBy(x: s, y: s)
-        t = t.translatedBy(x: -cx, y: -cy)
-        t = t.translatedBy(x: 0, y: dy)
+        let restored = view.alphaValue
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.06
+            view.animator().alphaValue = 0.78
+        }, completionHandler: {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.08
+                view.animator().alphaValue = restored
+            }
+        })
+    }
 
-        let current = (layer.presentation() ?? layer)
-        layer.setAffineTransform(t)
-
-        // 柔和波浪：低刚度 + 高阻尼的弹簧，过冲极小、缓缓落定
-        // （用 translation.y / scale 两个数值通道，避免 macOS NSValue 对 transform 的包装差异）
-        let fromY = current.value(forKeyPath: "transform.translation.y") as? CGFloat ?? 0
-        let fromS = current.value(forKeyPath: "transform.scale") as? CGFloat ?? 1
-        func addSpring(_ keyPath: String, from: CGFloat, to: CGFloat) {
-            let spring = CASpringAnimation(keyPath: keyPath)
-            spring.fromValue = from
-            spring.toValue = to
-            spring.mass = 1.1
-            spring.stiffness = 110
-            spring.damping = 16
-            spring.duration = spring.settlingDuration
-            spring.fillMode = .forwards
-            spring.isRemovedOnCompletion = false
-            layer.add(spring, forKey: "motionFloat." + keyPath)
+    /// 点击轻提示音。系统 Tink；找不到再读系统路径。static 缓存，只在主线程播放。
+    /// 测试里 Motion.enabled=false，guard 直接返回，不会出声、也不会加载声音。
+    static func playTap() {
+        guard enabled, !reduceMotion else { return }
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { playTap() }
+            return
         }
-        addSpring("transform.translation.y", from: fromY, to: dy)
-        addSpring("transform.scale", from: fromS, to: s)
+        tapSound?.play()
+    }
+
+    /// 悬停浮起：只动画 transform.translation.y，缓慢垂直上浮、无过冲。
+    /// `scale` 保留签名但忽略——缩放会让 NSView 图层横向错位（托管图层默认 anchorPoint=(0,0)，
+    /// 以左下为锚放大，视觉上像位置跳了）。禁止 CASpringAnimation / setAffineTransform 混缩放。
+    static func float(_ view: NSView, on: Bool, scale: CGFloat = 1.02, lift: CGFloat = 3,
+                      animated: Bool = true) {
+        _ = scale
+        view.wantsLayer = true
+        guard let layer = view.layer else { return }
+        // 先取呈现位置再撤旧动画，快速往返时从正在显示的位置继续，不跳回模型终点。
+        let fromY = (layer.presentation() ?? layer)
+            .value(forKeyPath: "transform.translation.y") as? CGFloat ?? 0
+        layer.removeAnimation(forKey: "motionBounce.scale")
+        layer.removeAnimation(forKey: "motionFloat.transform.scale")
+        layer.removeAnimation(forKey: "motionFloat.transform.translation.y")
+        layer.removeAnimation(forKey: "motionFloat.y")
+
+        let dy: CGFloat = enabled && !reduceMotion && on ? lift : 0
+        if enabled && !reduceMotion && animated {
+            let anim = CABasicAnimation(keyPath: "transform.translation.y")
+            anim.fromValue = fromY
+            anim.toValue = dy
+            anim.duration = on ? 0.28 : 0.34
+            anim.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.61, 0.36, 1)
+            layer.add(anim, forKey: "motionFloat.y")
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.transform = CATransform3DTranslate(CATransform3DIdentity, 0, dy, 0)
+        CATransaction.commit()
     }
 
     /// 悬停高亮（持续态）：背景层明暗柔和渐变
-    static func highlight(_ view: NSView, on: Bool, color: NSColor = NSColor(white: 1, alpha: 0.05)) {
-        guard enabled, !reduceMotion else { return }
+    static func highlight(_ view: NSView, on: Bool, color: NSColor = NSColor(white: 1, alpha: 0.05),
+                          rest: NSColor = .clear, animated: Bool = true) {
         view.wantsLayer = true
         guard let layer = view.layer else { return }
+        let from = (layer.presentation() ?? layer).backgroundColor
+        let target = (on ? color : rest).cgColor
+        layer.removeAnimation(forKey: "motionHighlight.color")
+        if enabled && !reduceMotion && animated {
+            let anim = CABasicAnimation(keyPath: "backgroundColor")
+            anim.fromValue = from
+            anim.toValue = target
+            anim.duration = on ? 0.22 : 0.28
+            anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(anim, forKey: "motionHighlight.color")
+        }
         CATransaction.begin()
-        CATransaction.setAnimationDuration(0.35)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
-        layer.backgroundColor = on ? color.cgColor : NSColor.clear.cgColor
+        CATransaction.setDisableActions(true)
+        layer.backgroundColor = target
         CATransaction.commit()
+    }
+
+    // MARK: - 窗口级过渡
+
+    /// 窗口出场：整体淡入 + 内容从 97% 轻微上浮 pop 出来（透明度只走窗口层，内容只做几何）。
+    /// 用于独立二级窗（设置后台、提前提醒）；悬浮窗的出场仍用 reveal（几何由窗口尺寸动画负责）。
+    static func present(_ window: NSWindow, duration: TimeInterval = 0.26) {
+        guard canAnimate else { return }
+        reveal(window, duration: duration)
+        if let content = window.contentView {
+            popIn(content, duration: duration, startScale: 0.97, dy: -5, startAlpha: nil)
+        }
+    }
+
+    /// 窗口退场：淡出后 orderOut，并恢复 alpha 供下次显示。Motion 关闭时同步 orderOut。
+    static func dismissWindow(_ window: NSWindow, duration: TimeInterval = 0.16,
+                              completion: (() -> Void)? = nil) {
+        guard canAnimate, window.isVisible else {
+            window.orderOut(nil)
+            completion?()
+            return
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            window.animator().alphaValue = 0
+        }, completionHandler: {
+            window.orderOut(nil)
+            window.alphaValue = 1
+            completion?()
+        })
+    }
+
+    /// 窗口 frame 过渡（胶囊↔面板、归位滑动）：frame 变化走 animator，内容随每一步
+    /// 真实 resize 重排。frame 未变或动效关闭时同步落位并回调。
+    static func animateWindowFrame(_ window: NSWindow, to frame: NSRect,
+                                   duration: TimeInterval = 0.3,
+                                   completion: (() -> Void)? = nil) {
+        guard canAnimate, !NSEqualRects(frame, window.frame) else {
+            window.setFrame(frame, display: true)
+            completion?()
+            return
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            window.animator().setFrame(frame, display: true)
+        }, completionHandler: completion)
     }
 }

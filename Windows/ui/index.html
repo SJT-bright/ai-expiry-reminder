@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><title>AI到期提醒</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<main id="floating" hidden>
+  <button id="pill" aria-label="展开到期提醒" title="点击展开，拖动移动">暂无记录</button>
+  <section id="expanded" hidden>
+    <header><span id="drag-handle" title="拖动移动">⌛</span><nav><button id="float-add" title="添加记录">＋</button><button id="float-refresh" title="刷新官方本地数据">⟳</button><button id="float-manage" title="管理记录">⚙</button><button id="collapse" title="收起">⌃</button></nav></header>
+    <div id="float-list"></div>
+    <footer><div class="controls"><button id="float-collapse">收起</button><button id="float-home">归位</button><button id="float-settings">管理</button><button id="float-hide">隐藏</button></div><label><input id="auto-collapse" type="checkbox">移开鼠标 8 秒后自动收起</label></footer>
+  </section>
+</main>
+<main id="management" hidden>
+  <header class="manager-title"><div><h1>AI 到期提醒</h1><p>订阅与额度窗口，放在一个地方。</p></div><span id="version"></span></header>
+  <div class="toolbar"><button id="add">＋ 添加</button><button id="refresh">⟳ 刷新本地数据</button><button id="export">导出</button><button id="import">导入</button><button id="backup">备份</button><button id="folder">数据文件夹</button></div>
+  <div id="notice" role="status" aria-live="polite"></div>
+  <div class="table-wrap"><table><thead><tr><th>名称</th><th>供应商</th><th>到期时间</th><th>剩余</th><th>操作</th></tr></thead><tbody id="records"></tbody></table><p id="empty" hidden>还没有提醒记录，点击“添加”记下第一笔订阅。</p></div>
+  <div class="settings"><label><input id="resident" type="checkbox">常驻（开机自启＋崩溃后恢复）</label><label>即将到期范围 <input id="horizon" type="number" min="1" max="3650"> 天</label><button id="apply-horizon">保存范围</button></div>
+  <p id="outside"></p><details><summary>本地读取状态</summary><div id="sources"></div><button id="restore-official">恢复已隐藏的官方条目</button></details>
+</main>
+<dialog id="editor"><form id="edit-form">
+  <h2 id="edit-title">添加提醒</h2><p class="muted">记录你实际购买的订阅或额度重置时间。</p>
+  <label>名称<input id="name" maxlength="200" placeholder="例如 Grok 订阅"></label>
+  <label>供应商<input id="vendor" maxlength="100" placeholder="可选，例如 xAI"></label>
+  <label>记录类型<select id="kind"><option value="subscription">一次性订阅到期</option><option value="weekly">订阅 · 每周额度分组</option><option value="window">周期额度（自动滚动）</option></select></label>
+  <label><span id="expiry-label">订阅到期时间</span><input id="expiry" type="datetime-local" required></label>
+  <label id="first-row" hidden>首次额度重置时间<input id="first" type="datetime-local"></label>
+  <div id="period-row" hidden><label>周期规则<select id="rule"><option value="rolling">按固定时长滚动</option><option value="calendarWeek">每周固定星期 00:00</option><option value="calendarMonth">每月固定日期 00:00</option><option value="anchorMonth">每月订阅日 00:00</option></select></label><label id="hours-row">周期（小时）<input id="period" type="number" min="0.01" max="100000" step="any" value="168"><small>5 小时＝5，每周＝168，每 30 天＝720</small></label><label id="param-row" hidden>重置日<input id="param" type="number" min="1" max="31" value="1"><small id="param-help">星期：1 为周一，7 为周日。</small></label></div>
+  <label>备注<textarea id="note" rows="2" maxlength="16000"></textarea></label><div id="plan" class="plan" hidden></div><p id="edit-error" class="error" role="alert"></p>
+  <div class="dialog-actions"><button id="cancel-edit" type="button">取消</button><button id="save" type="submit" class="primary">保存</button></div>
+</form></dialog>
+<dialog id="timing"><form id="timing-form"><h2>提前提醒</h2><p id="timing-name"></p><div class="timing-fields"><label>天<input id="days" type="number" min="0" max="3650" value="0" required></label><label>小时<input id="hours" type="number" min="0" max="23" value="5" required></label></div><p id="timing-preview" class="muted"></p><p id="timing-error" class="error" role="alert"></p><div class="dialog-actions"><button id="default-timing" type="button">恢复默认 5 小时</button><button id="cancel-timing" type="button">取消</button><button id="save-timing" type="submit" class="primary">保存</button></div></form></dialog>
+<script src="app.js"></script></body></html>

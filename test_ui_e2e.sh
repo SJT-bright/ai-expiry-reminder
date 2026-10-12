@@ -11,7 +11,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.sijunting.ai-expiry-reminder.ui-acceptance</string>
 <key>CFBundleName</key><string>AI到期提醒验收</string>
 <key>CFBundleExecutable</key><string>UIAcceptance</string>
-<key>LSUIElement</key><true/>
+<key>LSUIElement</key><false/>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 </dict></plist>
 PLIST

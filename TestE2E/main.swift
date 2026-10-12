@@ -16,15 +16,20 @@ final class AcceptanceDelegate: NSObject, NSApplicationDelegate {
         Store.shared.state.autoExpandDone = true
         panel = PanelController(loadOfficialData: false)
         panel.showPanel()
+        panel.showControls()
         if let window = panel.debugContentView?.window, let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main {
             window.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX, y: screen.visibleFrame.midY))
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.panel.tick() }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        panel.showControls()
+        return true
+    }
 }
 let app = NSApplication.shared
 let delegate = AcceptanceDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 app.run()

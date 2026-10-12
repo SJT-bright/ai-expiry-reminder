@@ -1,0 +1,52 @@
+{
+  "name": "ai-expiry-reminder-windows",
+  "version": "1.4.0",
+  "description": "AI 到期提醒 Windows 桌面版",
+  "author": "SJT-bright",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "test:ui": "electron . --smoke-test",
+    "dist": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "44.7.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.sijunting.ai-expiry-reminder.windows",
+    "productName": "AI到期提醒",
+    "asar": true,
+    "files": [
+      "main.js",
+      "core.js",
+      "readers.js",
+      "preload.js",
+      "ui/**/*",
+      "icon.png",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "icon": "icon.png",
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "artifactName": "AI-Expiry-Reminder-${version}-Windows-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "runAfterFinish": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "createDesktopShortcut": true,
+      "artifactName": "AI-Expiry-Reminder-${version}-Windows-${arch}-Setup.${ext}"
+    }
+  }
+}

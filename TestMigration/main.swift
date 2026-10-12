@@ -1,7 +1,11 @@
 import Foundation
 import SQLite3
 
-func check(_ condition: Bool, _ message: String) { guard condition else { fatalError(message) }; print("PASS: \(message)") }
+var failures: [String] = []
+func check(_ condition: Bool, _ message: String) {
+    // 汇总失败而不是 fatalError：一次跑完才看得清哪些是预期语义变更、哪些是真回归
+    if condition { print("PASS: \(message)") } else { print("FAIL: \(message)"); failures.append(message) }
+}
 func root() throws -> URL { let u=FileManager.default.temporaryDirectory.appendingPathComponent("expiry-migration-"+UUID().uuidString);try FileManager.default.createDirectory(at:u,withIntermediateDirectories:true);return u }
 func encode(_ value: AppState = AppState()) throws -> [String:Any] { let e=JSONEncoder();e.dateEncodingStrategy = .iso8601;return try JSONSerialization.jsonObject(with:e.encode(value)) as! [String:Any] }
 func legacyRow(_ name: String) throws -> [String:Any] { var i=SubItem.manualDefault(name:name);i.expiresAt=Date().addingTimeInterval(90*86400);let e=JSONEncoder();e.dateEncodingStrategy = .iso8601;return try JSONSerialization.jsonObject(with:e.encode(i)) as! [String:Any] }
@@ -34,12 +38,15 @@ do {
  check(try read(file)["syntheticUnknownField"] as? String=="preserve","cleanup preserves unknown original fields")
  let reopened=Store(environment:["AR_DATA_DIR":base.path]);check(reopened.manualItems.count==2,"successful migration survives restart without duplicate items")
 }
-// Invalid row never produces a partial migration; settings save retains it.
+// 逐行 best-effort：坏行不再连累好行（旧契约「一行坏→整批不入库」会让面板显示「暂无条目」，
+// 用户记录其实还在 state.json 里，等同于记录消失）。坏行原样留存待修，好行照常入库。
 do {
  let base=try root();defer{try? FileManager.default.removeItem(at:base)}
  let file=try writeLegacy(base,[try legacyRow("audit-valid"),["id":"audit-invalid"]]);let store=Store(environment:["AR_DATA_DIR":base.path]);store.save();waitIO()
- check(store.manualItems.isEmpty,"malformed row stops migration before all writes")
- check((try read(file)["manualItems"] as? [Any])?.count==2,"settings save retains valid and malformed legacy rows")
+ check(store.manualItems.count==1 && store.manualItems.first?.name=="audit-valid","坏行不连累好行：合法行已入库")
+ check((try read(file)["manualItems"] as? [Any])?.count==1,"settings save retains the malformed legacy row")
+ let again=Store(environment:["AR_DATA_DIR":base.path]);waitIO()
+ check(again.manualItems.count==1,"重开不重复导入已入库的合法行（幂等）")
 }
 // Already committed IDs must not overwrite later edits on cleanup retry.
 do {
@@ -50,4 +57,5 @@ do {
  let store=Store(environment:["AR_DATA_DIR":base.path]);check(store.manualItems.first?.name=="audit-newer-edit","cleanup retry preserves newer database edit")
  check(try read(file)["manualItems"]==nil,"idempotent retry cleans legacy JSON")
 }
-print("MIGRATION REGRESSIONS PASS")
+if failures.isEmpty { print("MIGRATION REGRESSIONS PASS") }
+else { print("FAILURES(\(failures.count)):"); failures.forEach { print("  ✗ \($0)") }; exit(1) }

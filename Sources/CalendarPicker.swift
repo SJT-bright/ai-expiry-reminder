@@ -2,7 +2,8 @@ import AppKit
 
 // MARK: - 月历浮层（DateTextField 的日期选择弹层）
 //
-// 底板走工程统一的 Glass（与悬浮窗同一口径），减弱动效判断仍就地取——不为两行代码把 Motion 拖进来。
+// 底板走工程统一的 Glass（与悬浮窗同一口径）。动效判断除了系统「减弱动态效果」，
+// 还必须认全局的 Motion.enabled——只读不改它，两行的事，不值得为这个把浮层搬走。
 
 /// 日历浮层窗口。
 /// canBecomeKey / canBecomeMain 恒为 false 是整块设计的支点：
@@ -29,6 +30,8 @@ private final class CalendarTileButton: NSButton {
     var todayMark = false
     /// 非本月的补位日：淡显；配合 isEnabled = false 使其点不动
     var dimmed = false
+    /// false：「今天」「确定」把轻点音留到 action 里，按下后拖出取消不会先响
+    var playTapOnMouseDown = true
     var text = ""
     var textFont: NSFont = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
     var textColorOverride: NSColor?
@@ -73,6 +76,12 @@ private final class CalendarTileButton: NSButton {
         guard hovering else { return }
         hovering = false
         needsDisplay = true
+    }
+
+    // 不是 HoverEffectButton，点日/月份/翻页都走这里。补位日 dimmed 且 disabled，按下也不出声。
+    override func mouseDown(with event: NSEvent) {
+        if isEnabled, !dimmed, playTapOnMouseDown { Motion.playTap() }
+        super.mouseDown(with: event)
     }
 
     /// 不调 super.draw：外观完全自绘，按下态用 isHighlighted 手动表达
@@ -148,15 +157,25 @@ final class CalendarPickerController: NSObject {
     private weak var host: NSWindow?
     private var anchorRect = NSRect.zero
     private var initial = Date()
+    /// 宿主文本此刻解析得动吗。false = 红框态，initial 只是「上一有效值」：
+    /// 拿它当基准亮着、再整串回填，等于把用户刚敲的年/月静默换掉（见 present）
+    private var initialIsValid = true
     private var onPick: ((Date) -> Void)?
-    private var selected = Date()
-    /// 当前显示的月份（恒为该月 1 号）
+    /// 本次会话选中的日：nil = 还没选过（无效文本进来时不预选，免得看着像已经定了）
+    private var selected: Date?
+    /// 当前显示的月份（恒为该月 1 号，时分跟随基准）
     private var displayed = Date()
+    /// 今日：整轮 rebuild 共用一份，不再每格 new Date()
+    private var today = Date()
     private enum Mode { case grid, months }
     private var mode: Mode = .grid
 
     private var container: CalendarFlippedView?
+    /// 当前内容页：翻月/模式切换时新旧两页并存做滑动交叉，旧页动画结束才移除
+    private var page: CalendarFlippedView?
     private var dayCells: [CalendarTileButton] = []
+    /// 「确定」按钮：pickDay 现在只选中不提交，自动化得能走真实点击链路把它按下
+    private var confirmButton: CalendarTileButton?
 
     private var mouseMonitor: Any?
     private var keyMonitor: Any?
@@ -175,16 +194,24 @@ final class CalendarPickerController: NSObject {
     /// 在 hostWindow 内、anchorRect 下方弹出日历。已打开时不叠第二层：换参数后重定位刷新。
     /// anchorRect 约定为 hostWindow 的视图坐标系（未翻转）；若取自 flipped 视图，
     /// 调用方先 view.convert(_, to: nil) 再传进来。
-    func present(initial: Date, anchorRect: NSRect, in hostWindow: NSWindow, onPick: @escaping (Date) -> Void) {
+    /// initialIsValid：宿主文本当前是否解析得动（默认 true，老调用点行为不变）。
+    /// 传 false 表示文本正处在红框无效态，`initial` 只是上一有效值 ——
+    /// 此时月历不预选、停在今天，且必须由用户显式点「确定」才回填，
+    /// 绝不把刚敲的年/月静默换成旧值。
+    func present(initial: Date, initialIsValid: Bool = true,
+                 anchorRect: NSRect, in hostWindow: NSWindow, onPick: @escaping (Date) -> Void) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async {
-                self.present(initial: initial, anchorRect: anchorRect, in: hostWindow, onPick: onPick)
+                self.present(initial: initial, initialIsValid: initialIsValid,
+                             anchorRect: anchorRect, in: hostWindow, onPick: onPick)
             }
             return
         }
         self.initial = initial
-        self.selected = initial
-        self.displayed = startOfMonth(initial)
+        self.initialIsValid = initialIsValid
+        self.selected = initialIsValid ? initial : nil
+        // 基准月跟 initial 走；文本无效时停在今天，别把用户领进上一次那个旧月份
+        self.displayed = startOfMonth(initialIsValid ? initial : Date())
         self.anchorRect = anchorRect
         self.host = hostWindow
         self.onPick = onPick
@@ -220,10 +247,17 @@ final class CalendarPickerController: NSObject {
         activeAppObserver = nil
         for o in hostObservers { NotificationCenter.default.removeObserver(o) }
         hostObservers.removeAll()
-        panel?.orderOut(nil)
-        panel = nil
+        // 淡出退场：先摘掉 self.panel 再动画，期间重新弹出会建新窗、旧窗自行走完动画后释放
+        if let p = panel {
+            self.panel = nil
+            Motion.dismissWindow(p)
+        }
         container = nil
+        page = nil
         dayCells.removeAll()
+        confirmButton = nil
+        selected = nil
+        initialIsValid = true
         onPick = nil
         host = nil
         if wasVisible { onOpenChanged?(false) }
@@ -245,6 +279,7 @@ final class CalendarPickerController: NSObject {
 
     /// 导航到 (y, m) 后点击该日格子，与真实点击走同一条 action 链路。
     /// 返回 false = 该日不在本月可点格子里。
+    /// 注意：pickDay 现在只更新选中态不提交（先选后确认），选完要再 debugConfirm() 才回填宿主。
     @discardableResult
     func debugTap(year: Int, month: Int, day: Int) -> Bool {
         guard isVisible,
@@ -260,6 +295,17 @@ final class CalendarPickerController: NSObject {
         return true
     }
 
+    /// 按下「确定」：与真实点击同链路。选完日后必须走这一步才提交（等价于用户点确定）
+    @discardableResult
+    func debugConfirm() -> Bool {
+        guard isVisible, let b = confirmButton else { return false }
+        b.performClick(nil)
+        return true
+    }
+
+    /// 当前选中日（nil = 还没选过）：自动化断言「点日只选中、没提交」用
+    var debugSelected: Date? { selected }
+
     // MARK: 建窗与定位
 
     private func buildPanel() {
@@ -267,13 +313,11 @@ final class CalendarPickerController: NSObject {
         let p = CalendarPickerPanel(contentRect: NSRect(origin: .zero, size: size),
                                     styleMask: [.borderless, .nonactivatingPanel],
                                     backing: .buffered, defer: false)
-        // .popUpMenu 同时压过 .floating 悬浮窗与普通窗口：两种宿主都在它下面
-        p.level = .popUpMenu
+        FloatingWindowPolicy.prepareAccessory(p)
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = true              // 玻璃只管「透出背后」，浮层与宿主的分离感还得靠窗影
         p.hidesOnDeactivate = false
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         p.appearance = NSAppearance(named: .darkAqua)
         p.isMovableByWindowBackground = false
         p.worksWhenModal = true              // 期间弹 NSAlert（删除确认）也不该把浮层卡成死板
@@ -286,11 +330,16 @@ final class CalendarPickerController: NSObject {
 
         let box = CalendarFlippedView(frame: NSRect(origin: .zero, size: size))
         box.autoresizingMask = [.width, .height]
+        // 内容页与容器分离：翻页时旧页留在容器里滑出，新页滑入
+        let pageView = CalendarFlippedView(frame: box.bounds)
+        pageView.autoresizingMask = [.width, .height]
+        box.addSubview(pageView)
         // 内容只能走 contentView：头文件明说兄弟子视图与玻璃的 z-order 系统不保证
         glass.contentView = box
         p.contentView = glass                // 漏了这行就是「玻璃板有了、内容全在天上」
         panel = p
         container = box
+        page = pageView
     }
 
     /// 屏幕坐标 y 轴向上，「下方」即减小 y。
@@ -314,34 +363,72 @@ final class CalendarPickerController: NSObject {
                           width: size.width, height: size.height), display: true)
     }
 
-    /// 与 Motion.reveal 同族但更短：弹层不该有存在感，淡入即可；遵循系统「减弱动态效果」
+    /// 与 Motion.reveal 同族但更短：弹层不该有存在感，淡入即可。
+    /// 判断口径必须与 Motion 内部一致：`Motion.enabled` 是全局测试开关，
+    /// TestRender 置 false 的契约是「所有动效直通最终态」——只判系统减弱开关会绕过去，
+    /// 截图抓到 0.7 的半透明浮层，断言跟着飘。
+    /// 内容页再叠一个轻微的「从锚点长出来」pop：整体淡入 + 内容微缩放归位。
     private func fadeIn(_ p: NSWindow) {
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        guard Motion.enabled, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         p.alphaValue = 0.7
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.16
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             p.animator().alphaValue = 1
         }
+        if let page {
+            Motion.popIn(page, duration: 0.22, startScale: 0.95, dy: 4, startAlpha: nil)
+        }
     }
 
     // MARK: 内容构建
 
-    private func rebuild() {
-        guard let box = container else { return }
-        box.subviews.forEach { $0.removeFromSuperview() }
+    /// 页面过渡类型：翻月带方向感（旧页向反方向滑出、新页滑入）；
+    /// 日历网格 ↔ 月列表做上下交叉滑换。选择日期等原位刷新走 .none。
+    private enum PageTransition { case none, forward, backward, morph }
+
+    private func rebuild(transition: PageTransition = .none) {
+        guard let box = container, let old = page else { return }
+        today = Date()                                   // 一轮重建只取一次今日
         dayCells.removeAll()
+        confirmButton = nil
 
         let weekdayY = CalendarMetrics.padTop + CalendarMetrics.headerH + CalendarMetrics.gridGap
         let gridY = weekdayY + CalendarMetrics.weekdayH + CalendarMetrics.gridGap
 
-        buildHeader(in: box, y: CalendarMetrics.padTop)
-        buildWeekdays(in: box, y: weekdayY)
+        let fresh = CalendarFlippedView(frame: box.bounds)
+        fresh.autoresizingMask = [.width, .height]
+        page = fresh
+        box.addSubview(fresh)
+        buildHeader(in: fresh, y: CalendarMetrics.padTop)
+        buildWeekdays(in: fresh, y: weekdayY)
         switch mode {
-        case .grid: buildDayGrid(in: box, y: gridY)
-        case .months: buildMonthGrid(in: box, y: gridY)
+        case .grid: buildDayGrid(in: fresh, y: gridY)
+        case .months: buildMonthGrid(in: fresh, y: gridY)
         }
-        buildFooter(in: box, y: gridY + CalendarMetrics.gridH + CalendarMetrics.footerGap)
+        buildFooter(in: fresh, y: gridY + CalendarMetrics.gridH + CalendarMetrics.footerGap)
+
+        switch transition {
+        case .none:
+            old.removeFromSuperview()
+        case .forward, .backward:
+            // 看下一页：旧页向左滑出、新页从右滑入；翻上一页镜像
+            let d: CGFloat = transition == .forward ? 64 : -64
+            lockPage(old)
+            Motion.slideOut(old, dx: -d, duration: 0.24) { old.removeFromSuperview() }
+            Motion.slideIn(fresh, dx: d, duration: 0.26)
+        case .morph:
+            // 网格 ↔ 月列表：上下交叉滑换
+            lockPage(old)
+            Motion.slideOut(old, dy: -12, duration: 0.2) { old.removeFromSuperview() }
+            Motion.slideIn(fresh, dy: 12, duration: 0.24)
+        }
+    }
+
+    /// 过渡期间的旧页按钮全部停用：新旧页短暂重叠时，点到的必须只有新页
+    private func lockPage(_ view: NSView) {
+        if let b = view as? NSButton { b.isEnabled = false }
+        view.subviews.forEach(lockPage)
     }
 
     private func buildHeader(in box: NSView, y: CGFloat) {
@@ -369,7 +456,10 @@ final class CalendarPickerController: NSObject {
     }
 
     private func buildWeekdays(in box: NSView, y: CGFloat) {
-        // 恒周一起：工程里「1=周一…7=周日」是既有语义，不跟随 locale 的 firstWeekday
+        // 恒周一起：这是有意决策，不跟随 locale 的 firstWeekday。
+        // 工程里「1=周一…7=周日」是既有语义（周额度划分、面板排期都按它算），
+        // 表头跟着 cal.firstWeekday 走会让同一个条目的列位随系统语言漂移。
+        // 代价：en_US 下看着别扭（美国习惯周日起）——本产品面向中文用户，宁可保持一致。
         for (i, name) in ["一", "二", "三", "四", "五", "六", "日"].enumerated() {
             let label = NSTextField(labelWithString: name)
             label.font = .systemFont(ofSize: 9)
@@ -420,7 +510,8 @@ final class CalendarPickerController: NSObject {
             b.corner = 8
             b.yearValue = year(of: displayed)
             b.monthValue = m
-            b.filled = m == month(of: selected) && year(of: displayed) == year(of: selected)
+            // 没选过日就不高亮任何月份：预选状态在无效文本下是误导
+            b.filled = selected.map { year(of: displayed) == year(of: $0) && month(of: displayed) == month(of: $0) } ?? false
             b.target = self
             b.action = #selector(pickMonth(_:))
             b.setAccessibilityIdentifier("calMonth-\(m)")
@@ -429,19 +520,23 @@ final class CalendarPickerController: NSObject {
     }
 
     private func buildFooter(in box: NSView, y: CGFloat) {
-        let today = makeButton(frame: NSRect(x: CalendarMetrics.padX, y: y, width: 62, height: CalendarMetrics.footerH),
-                               text: "今天", action: #selector(pickToday), font: .systemFont(ofSize: 11))
-        today.setAccessibilityIdentifier("calToday")
-        // 「确定」提交当前选中日（从没选过就是 initial 那天）：值恒等，所以幂等；
-        // 做成「关闭」反而多一条「用户以为已经保存了」的歧义分支
+        // 局部名避开属性 today（今日环的基准时刻）
+        let todayBtn = makeButton(frame: NSRect(x: CalendarMetrics.padX, y: y, width: 62, height: CalendarMetrics.footerH),
+                                  text: "今天", action: #selector(pickToday), font: .systemFont(ofSize: 11))
+        todayBtn.playTapOnMouseDown = false
+        todayBtn.setAccessibilityIdentifier("calToday")
+        // 「确定」= 唯一的显式提交口（点日只选中，先看着再确认）。从没选过就回填 initial：
+        // 值恒等所以幂等；做成「关闭」反而多一条「用户以为已经保存了」的歧义分支
         let confirm = makeButton(frame: NSRect(x: CalendarMetrics.width - CalendarMetrics.padX - 56, y: y,
                                                width: 56, height: CalendarMetrics.footerH),
                                  text: "确定", action: #selector(confirmPick),
                                  font: .systemFont(ofSize: 11, weight: .semibold))
         confirm.filled = true
         confirm.corner = 6
+        confirm.playTapOnMouseDown = false
         confirm.setAccessibilityIdentifier("calConfirm")
-        box.addSubview(today)
+        confirmButton = confirm
+        box.addSubview(todayBtn)
         box.addSubview(confirm)
     }
 
@@ -455,12 +550,16 @@ final class CalendarPickerController: NSObject {
         return b
     }
 
-    /// 今日 = 描边、选中 = 实心：两套标记互不覆盖，同格可并存
+    /// 今日 = 描边、选中 = 实心：两套标记互不覆盖，同格可并存。
+    /// 今日取自 rebuild 缓存的那一份，不再每格 new Date()（一轮 42 格 42 次分配）。
+    /// 浮层挂到跨午夜仍未刷新今日环是已知取舍：补这一条要加计时器，
+    /// 而 dismiss() 的「全程零计时器」约定是防残留的支点，不值当为半夜那一下破掉。
     private func mark(_ cell: CalendarTileButton) {
-        let t = Date()
-        cell.todayMark = cell.yearValue == year(of: t) && cell.monthValue == month(of: t) && cell.dayValue == day(of: t)
-        cell.filled = cell.yearValue == year(of: selected) && cell.monthValue == month(of: selected)
-            && cell.dayValue == day(of: selected)
+        cell.todayMark = cell.yearValue == year(of: today) && cell.monthValue == month(of: today)
+            && cell.dayValue == day(of: today)
+        guard let sel = selected else { cell.filled = false; return }
+        cell.filled = cell.yearValue == year(of: sel) && cell.monthValue == month(of: sel)
+            && cell.dayValue == day(of: sel)
     }
 
     // MARK: 动作
@@ -468,41 +567,56 @@ final class CalendarPickerController: NSObject {
     @objc private func stepBackward() { shift(-1) }
     @objc private func stepForward() { shift(1) }
 
+    /// 可翻到的年份上下界：无限点 › 能跑到公元几万年，格子毫无意义（也避开 Date 上溢）
+    private static let yearBounds = 1900...9999
+
     private func shift(_ delta: Int) {
         let unit: Calendar.Component = mode == .grid ? .month : .year
-        displayed = cal.date(byAdding: unit, value: delta, to: displayed) ?? displayed
-        rebuild()
+        guard let next = cal.date(byAdding: unit, value: delta, to: displayed),
+              Self.yearBounds.contains(cal.component(.year, from: next)) else { return }
+        displayed = next
+        rebuild(transition: delta > 0 ? .forward : .backward)
     }
 
     @objc private func toggleMode() {
         mode = mode == .grid ? .months : .grid
-        rebuild()
+        rebuild(transition: .morph)
     }
 
     @objc private func pickMonth(_ sender: CalendarTileButton) {
         displayed = date(year: sender.yearValue, month: sender.monthValue, day: 1, keepingTimeOf: displayed)
             ?? displayed
         mode = .grid
-        rebuild()
+        rebuild(transition: .morph)
     }
 
+    /// 点日只更新选中态并重建网格：原先「点日即 commit→dismiss」让实心高亮一闪而过，
+    /// 用户既看不清自己选了哪天，也没有「先看后确认」的机会。退出交给「确定 / 今天」。
     @objc private func pickDay(_ sender: CalendarTileButton) {
         guard sender.isEnabled,
               let d = date(year: sender.yearValue, month: sender.monthValue, day: sender.dayValue,
                            keepingTimeOf: initial) else { return }
         selected = d
-        commit(d)
+        rebuild()
     }
 
     /// 「今天」直接提交今天（哪怕正看着别的月份）：与系统选择器语义一致，不做静默翻页
     @objc private func pickToday() {
         let t = Date()
         guard let d = date(year: year(of: t), month: month(of: t), day: day(of: t), keepingTimeOf: initial) else { return }
+        Motion.playTap()
         selected = d
         commit(d)
     }
 
-    @objc private func confirmPick() { commit(selected) }
+    /// 「确定」：有选中日就回填它；从没选过则回填 initial（值恒等，幂等）。
+    /// 例外——宿主文本处于无效态时不回填：那等于把用户刚敲的年/月静默换成上一有效值，
+    /// 直接关窗、把红框留给用户自己改。
+    @objc private func confirmPick() {
+        Motion.playTap()
+        if let sel = selected { commit(sel); return }
+        if initialIsValid { commit(initial) } else { dismiss() }
+    }
 
     /// 先收窗再回调：onPick 里往往要重排宿主甚至弹 alert，别让浮层还挂在屏幕上
     private func commit(_ d: Date) {
@@ -525,8 +639,17 @@ final class CalendarPickerController: NSObject {
         return d
     }
 
+    /// 月首（该月 1 号），但时:分:秒跟着基准走。
+    /// 原来只取 [年,月] → 落在当天 0 点，而格子是「基准 + N 天」推出来的：
+    /// 午夜发生 DST 切换的时区里 0 点那天可能根本不存在，Foundation 会把它挪到次日，
+    /// 于是整月错一列。基准只要不在午夜，加减天都不会错日（date(byAdding:.day) 走的是
+    /// 日历天语义，保留墙上时间）。基准正好是 0 点 0 分时改用当天正午，同一天、不踩切换点。
+    /// 注：此项未做跨时区 DST 实测，属低风险推断修正。
     private func startOfMonth(_ d: Date) -> Date {
-        cal.date(from: cal.dateComponents([.year, .month], from: d)) ?? d
+        var c = cal.dateComponents([.era, .year, .month, .hour, .minute, .second], from: d)
+        c.day = 1
+        if (c.hour ?? 0) == 0 && (c.minute ?? 0) == 0 { c.hour = 12 }
+        return cal.date(from: c) ?? d
     }
 
     private func year(of d: Date) -> Int { cal.component(.year, from: d) }

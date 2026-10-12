@@ -10,3 +10,12 @@ build/
 # 系统与日志
 .DS_Store
 *.log
+Windows/node_modules/
+Windows/dist/
+Windows/.cache/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+state.json
+native-smoke-receipt.json
+.release-local/

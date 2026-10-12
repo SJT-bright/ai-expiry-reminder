@@ -61,7 +61,9 @@ func checkWeeklyStructure(_ m: [SubItem], _ label: String, anchor: Date, expiry:
         check(false, "\(label)：周期组条目数应 ≥ 2 才能逐轮核对，实际 \(m.count)")
         return
     }
-    check(approx(m.first!.expiresAt, anchor), "\(label)：首档 = 首次重置锚点")
+    check(approx(m.first!.expiresAt, anchor),
+          "\(label)：首档 = 首次重置锚点（实测首档 \(Int(m.first!.expiresAt.timeIntervalSince1970))、"
+          + "锚点 \(Int(anchor.timeIntervalSince1970))、差 \(String(format: "%.1f", m.first!.expiresAt.timeIntervalSince(anchor))) 秒）")
     let gaps = zip(m, m.dropFirst()).map { $1.expiresAt.timeIntervalSince($0.expiresAt) }
     let gapDays = gaps.map { Int(($0 / day).rounded()) }
     check(gaps.allSatisfy { abs($0 - 7 * day) < 5 },
@@ -123,8 +125,11 @@ final class Delegate: NSObject, NSApplicationDelegate {
                                       expiry: self.now.addingTimeInterval(31 * self.DAY), day: self.DAY)
             // 建议文案是「整组一条」写入的（Models.saveWeeklySplit 对每轮复用同一串），
             // 故只能核对组级内容，无法逐轮区分首轮/末轮措辞。
-            check(m.allSatisfy { $0.note.contains("快点用") && $0.note.contains("2 天") },
-                  "S1：组内建议含首轮 2 天快点用")
+            // 只断言「有催促」，不钉天数：锚点由整分对齐的 now 推出，生产按真实 Date() 复核，
+            // 差值 Δ 落在 0.001 天归一的哪一侧取决于本次跑了多少秒 → 具体数字本质上会翻档。
+            // floor 口径本身由 TestLogic 用显式 now 确定性覆盖（2.5 天 → 说 2 天）。
+            check(m.allSatisfy { $0.note.contains("快点用") },
+                  "S1：短首轮在组内每一条都带「快点用」催促")
             check(m.allSatisfy { $0.note.contains("再等 6 天") },
                   "S1：组内建议含续买再等 6 天（30+7−31）")
         }))
@@ -159,13 +164,15 @@ final class Delegate: NSObject, NSApplicationDelegate {
             // 不是「·第k/n周」；查 SuperGrok·第 前缀永远为空，等于没断言。
             check(phantomWindows(of: "SuperGrok").isEmpty, "S5：不凭空生成周期窗口（无 ·周期重置 / qreset: 伴生）")
         }))
-        // S6 通义千问：每周一 00:00 重置 → 锚点取下一个周一，7 天步进应保持周一
+        // S6 通义千问：每周一 00:00 重置 → 锚点取「今天之后」的下一个周一
+        // 不能从今天 00:00 起算：真到周一那天跑，锚点会算成已过去的时刻，
+        // 被「丢弃已过期轮次」规则正确剔掉，首档落到 +7d（实测差 604800 秒）。
         let cal = Calendar.current
-        let nextMonday = cal.startOfDay(for: {
-            var d = self.now
+        let nextMonday: Date = {
+            var d = cal.startOfDay(for: self.now).addingTimeInterval(self.DAY)   // 从明天 00:00 起找
             while cal.component(.weekday, from: d) != 2 { d = d.addingTimeInterval(self.DAY) }
             return d
-        }())
+        }()
         let qwenExpiry = self.now.addingTimeInterval(45 * self.DAY)
         scenarios.append(("S6 千问每周一", "Qwen Code 月付", "阿里云", 1, 45 * DAY, nextMonday.timeIntervalSince(self.now), {
             let m = members("Qwen Code 月付·第")
@@ -209,8 +216,10 @@ final class Delegate: NSObject, NSApplicationDelegate {
                                       expiry: self.now.addingTimeInterval(15 * self.DAY), day: self.DAY)
             check(m.last?.name == "边界探针B·第3/3周" && approx(m.last!.expiresAt, self.now.addingTimeInterval(15 * self.DAY)),
                   "S11：末档恰好落在到期日（1+7+7=15）")
-            check(m.first?.note.contains("1 天") == true && m.first?.note.contains("快点用") == true,
-                  "S11：首轮 1 天 → 快点用")
+            // 同 S1：Δ 会让「整 1 天」的锚点落在 1 天或 23 小时两种文案之间，
+            // 这里只钉语义（短首轮必被催促），数字口径交给 TestLogic 的显式 now。
+            check(m.first?.note.contains("快点用") == true,
+                  "S11：短首轮（约 1 天）→ 提示快点用")
         }))
         // S12 Netflix 年付 → 一次性长周期
         scenarios.append(("S12 Netflix年付", "Netflix 会员", "其他", 0, 300 * DAY, nil, {

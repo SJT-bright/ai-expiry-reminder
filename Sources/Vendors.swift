@@ -54,21 +54,59 @@ enum VendorResetKnowledge {
              candidate: nil),   // 规则因站而异，宁缺毋滥
     ]
 
-    /// 供应商名包含匹配，返回第一条命中的提示；未命中返回通用提示
+    /// 在所有命中的规则里挑最特异的一条。
+    /// 旧写法是 `rules.first { ... }` 按声明顺序取第一条：OpenAI 规则在 index 0、
+    /// 中转站规则（candidate == nil，本意「宁缺毋滥」）在 index 5，于是「中转站 Codex 周卡」
+    /// 被 OpenAI 抢先匹配，自动往真实库里写一个 5h rolling 伴生窗口。
+    /// 现在：① 明确表态「不自动补全」的规则（candidate == nil）优先；
+    /// ② 其次按命中关键词的长度（关键词越长越特异）；③ 平局仍按声明顺序。
+    static func bestRule(for nameOrVendor: String) -> Rule? {
+        let v = nameOrVendor.lowercased()
+        var result: Rule?
+        var resultReservedCandidate = false
+        var resultKeywordLength = 0
+        for rule in rules {
+            let keywordLength = longestMatchedKeyword(rule, in: v)
+            guard keywordLength > 0 else { continue }
+            let reserved = rule.candidate == nil
+            let wins: Bool
+            if result == nil {
+                wins = true
+            } else if reserved != resultReservedCandidate {
+                wins = reserved
+            } else {
+                wins = keywordLength > resultKeywordLength
+            }
+            if wins {
+                result = rule
+                resultReservedCandidate = reserved
+                resultKeywordLength = keywordLength
+            }
+        }
+        return result
+    }
+
+    /// 该规则命中的最长关键词长度（用于比较特异性）；未命中返回 0
+    private static func longestMatchedKeyword(_ rule: Rule, in lowered: String) -> Int {
+        var length = 0
+        for keyword in rule.match where lowered.contains(keyword.lowercased()) {
+            length = max(length, keyword.count)
+        }
+        return length
+    }
+
+    /// 供应商名包含匹配，返回命中的最特异规则的提示；未命中返回通用提示
     static func hint(for vendor: String) -> String? {
-        let v = vendor.lowercased()
-        return rules.first { rule in rule.match.contains { v.contains($0.lowercased()) } }?.hint
+        return bestRule(for: vendor)?.hint
     }
 
     /// 机器可读的最佳重置规则候选；无把握的厂商返回 nil（调用方不生成重置窗口）
     static func bestCandidate(for vendor: String) -> ResetRuleCandidate? {
-        let v = vendor.lowercased()
-        return rules.first { rule in rule.match.contains { v.contains($0.lowercased()) } }?.candidate
+        return bestRule(for: vendor)?.candidate
     }
 
     /// 反向识别：条目名称/供应商名含关键词 → 规范供应商名（如名称含 "Codex" → "OpenAI"）；未命中返回 nil
     static func vendor(for nameOrVendor: String) -> String? {
-        let v = nameOrVendor.lowercased()
-        return rules.first { rule in rule.match.contains { v.contains($0.lowercased()) } }?.canonical
+        return bestRule(for: nameOrVendor)?.canonical
     }
 }
