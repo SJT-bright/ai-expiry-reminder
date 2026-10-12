@@ -9,7 +9,7 @@
     "start": "electron .",
     "test": "node --test test/*.test.js",
     "test:ui": "electron . --smoke-test",
-    "dist": "electron-builder --win"
+    "dist": "node build.cjs"
   },
   "devDependencies": {
     "electron": "44.7.0",

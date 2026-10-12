@@ -45,3 +45,5 @@ npm run dist -- --arm64
 在 Mac 上运行 Windows 开发预览时，默认使用独立的 `AI到期提醒-Windows预览` 数据目录；正式 Mac 应用继续使用自己的数据目录。
 
 Windows 原生宿主受系统最小窗口高度限制，可见胶囊仍为 54×18；宿主多出的区域透明并透传鼠标。验收分别检查可见胶囊和原生宿主尺寸，不能用网页尺寸冒充原生窗口边界。
+
+构建入口固定使用安装解码器支持的 BCJ 压缩过滤器，避免 electron-builder 26.15 的 [ARM64 安装后丢失 EXE / DLL 问题](https://github.com/electron-userland/electron-builder/issues/9983)。请使用 `npm run dist`，让构建和安装检查采用相同配置。
