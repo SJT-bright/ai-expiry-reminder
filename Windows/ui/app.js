@@ -29,6 +29,7 @@ function refreshCountdowns() {
 function render(event = null) {
   if (!snapshot) return;
   $('floating').hidden = view !== 'float'; $('management').hidden = view === 'float';
+  document.body.classList.toggle('collapsed',snapshot.state.panelCollapsed !== false);
   $('pill').hidden = snapshot.state.panelCollapsed === false; $('expanded').hidden = snapshot.state.panelCollapsed !== false;
   $('auto-collapse').checked = snapshot.state.panelAutoCollapse !== false;
   $('resident').checked = Boolean(snapshot.state.resident);
@@ -148,6 +149,12 @@ document.addEventListener('keydown',event => { if ((event.ctrlKey || event.metaK
 document.body.addEventListener('mouseenter',() => clearTimeout(collapseTimer));
 document.body.addEventListener('mouseleave',() => { if (view === 'float' && snapshot?.state.panelAutoCollapse !== false) collapseTimer = setTimeout(() => safe(() => call('expand',{value:false})),8000); });
 let pointer = null, dragged = false;
+let ignorePadding = false;
+document.addEventListener('mousemove',event => {
+  if (view !== 'float' || pointer || !snapshot) return;
+  const ignore = snapshot.state.panelCollapsed !== false && event.clientY >= 18;
+  if (ignore !== ignorePadding) { ignorePadding = ignore; safe(() => call('pointer-ignore',{ignore})); }
+});
 for (const element of [$('pill'),$('drag-handle')]) {
   element.onpointerdown = e => { if (e.button !== 0) return; dragged = false; pointer = {x:e.screenX,y:e.screenY}; element.setPointerCapture(e.pointerId); };
   element.onpointermove = e => { if (!pointer || !e.buttons) return; const x = e.screenX-pointer.x, y = e.screenY-pointer.y; if (dragged || Math.hypot(x,y) > 4) { dragged = true; pointer = {x:e.screenX,y:e.screenY}; safe(() => call('move',{x,y})); } };

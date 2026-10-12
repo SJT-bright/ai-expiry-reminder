@@ -15,6 +15,7 @@ if (smoke) app.setName('AI到期提醒 Windows 验收');
 else app.setName('AI到期提醒');
 let store, panel, manager, tray, watchdog, quitting = false, refreshing = false;
 let official = [], statuses = [], manual = [], reminderHours = {}, lastAlert = new Set(), alertOpen = false;
+let minimumHostHeight = 18;
 const timerHandles = [];
 function startArguments() { return app.isPackaged ? [] : [__dirname]; }
 function startWatchdog() {
@@ -45,14 +46,19 @@ function workArea() { return screen.getDisplayMatching(panel?.getBounds() || scr
 function geometry(collapsed, preserve = true) {
   const area = workArea(), previous = panel?.getBounds();
   const count = contents().items.filter(r => isDisplayable(r) && r.expires_at-seconds() <= store.state.displayHorizonDays*86400).length;
-  const width = collapsed ? 54 : 240, height = collapsed ? 18 : Math.min(area.height-32,112+Math.min(Math.max(count,1),8)*56);
+  const width = collapsed ? 54 : 240, height = collapsed ? minimumHostHeight : Math.min(area.height-32,112+Math.min(Math.max(count,1),8)*56);
   const x = preserve && previous ? previous.x+previous.width-width : area.x+area.width-width-10;
   const y = preserve && previous ? previous.y : area.y+10;
   return {x:Math.max(area.x,Math.min(x,area.x+area.width-width)),y:Math.max(area.y,Math.min(y,area.y+area.height-height)),width,height};
 }
 function expand(value) {
   store.saveState({panelCollapsed:!value});
+  panel.setIgnoreMouseEvents(false);
+  applyMaterial(!value);
   panel.setBounds(geometry(!value)); panel.show(); broadcast();
+}
+function applyMaterial(collapsed) {
+  if (process.platform === 'win32' && Number(os.release().split('.')[2]) >= 22621) panel.setBackgroundMaterial(collapsed ? 'none' : 'acrylic');
 }
 function makeWindow(options, view) {
   const window = new BrowserWindow({...options,icon:path.join(__dirname,'icon.png'),webPreferences:{preload:path.join(__dirname,'preload.js'),contextIsolation:true,nodeIntegration:false,sandbox:true}});
@@ -155,6 +161,7 @@ async function action(operation, payload = {}) {
       panel.setPosition(Math.round(bounds.x+payload.x),Math.round(bounds.y+payload.y));
       store.saveState({position:panel.getPosition()}); break;
     }
+    case 'pointer-ignore': if (process.platform === 'win32') panel.setIgnoreMouseEvents(Boolean(payload.ignore),{forward:true}); break;
     case 'quit': quitting = true; stopWatchdog(); app.quit(); break;
     default: throw new Error('未知操作。');
   }
@@ -183,9 +190,12 @@ async function runSmoke() {
   const exportData = store.exportData();
   store.delete(saved.id); check(store.items().length === 0,'delete removes only selected record');
   store.importData(exportData); reload(); check(store.items().length === 1,'backup import restores deleted item');
-  for (let i = 0; i < 40 && (panel.getBounds().width !== 54 || panel.getBounds().height !== 18); i++) await new Promise(resolve => setTimeout(resolve,50));
+  for (let i = 0; i < 40 && (panel.getBounds().width !== 54 || panel.getBounds().height !== minimumHostHeight); i++) await new Promise(resolve => setTimeout(resolve,50));
   evidence.collapsedBounds = panel.getBounds();
-  check(evidence.collapsedBounds.width === 54 && evidence.collapsedBounds.height === 18,'native collapsed window is 54×18: ' + JSON.stringify(evidence.collapsedBounds));
+  evidence.visibleCapsule = await panel.webContents.executeJavaScript('({width:document.getElementById("floating").getBoundingClientRect().width,height:document.getElementById("floating").getBoundingClientRect().height})');
+  check(evidence.visibleCapsule.width === 54 && evidence.visibleCapsule.height === 18,'visible capsule is 54×18');
+  check(evidence.collapsedBounds.width === 54 && evidence.collapsedBounds.height === minimumHostHeight,'native host respects platform minimum: ' + JSON.stringify(evidence.collapsedBounds));
+  if (process.platform === 'win32') { panel.setIgnoreMouseEvents(true,{forward:true}); panel.setIgnoreMouseEvents(false); check(true,'transparent host padding supports mouse pass-through'); }
   expand(true);
   for (let i = 0; i < 40 && panel.getBounds().width !== 240; i++) await new Promise(resolve => setTimeout(resolve,50));
   evidence.expandedBounds = panel.getBounds();
@@ -220,14 +230,15 @@ else {
   app.on('second-instance',() => { if (panel) expand(true); });
   app.whenReady().then(async () => {
     try {
-      // Windows 默认菜单栏占用 21px，会把 18px 胶囊撑到 39px。
-      // 操作入口已由胶囊、管理页和托盘提供，保持浮窗没有菜单栏。
+      // 操作入口已由胶囊、管理页和托盘提供，浮窗不使用菜单栏。
       Menu.setApplicationMenu(null);
       store = new Store(directory); store.lifecycle(); manual = store.items(); reminderHours = store.reminderSettings();
       panel = makeWindow({width:54,height:18,minWidth:54,minHeight:18,frame:false,thickFrame:false,transparent:true,backgroundColor:'#00000000',resizable:false,minimizable:false,maximizable:false,fullscreenable:false,skipTaskbar:true,alwaysOnTop:true,show:false},'float');
+      // Win32 对宿主最小高度的限制不影响 54×18 可见胶囊；多出的区域透明且透传鼠标。
+      minimumHostHeight = Math.max(18,panel.getBounds().height);
       panel.setAlwaysOnTop(true,'screen-saver');
       panel.setVisibleOnAllWorkspaces(true,{visibleOnFullScreen:true});
-      if (process.platform === 'win32' && Number(os.release().split('.')[2]) >= 22621) panel.setBackgroundMaterial('acrylic');
+      applyMaterial(store.state.panelCollapsed !== false);
       panel.setBounds(geometry(store.state.panelCollapsed !== false,false));
       if (Array.isArray(store.state.position) && store.state.position.length === 2 && store.state.position.every(Number.isFinite)) {
         const area = screen.getDisplayNearestPoint({x:store.state.position[0],y:store.state.position[1]}).workArea;
