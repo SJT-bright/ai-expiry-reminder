@@ -9,7 +9,7 @@ const {Store,seconds,nextRoll,timingAllowed,isDisplayable,weeklyPlan} = require(
 const smoke = process.argv.includes('--smoke-test');
 const watchdogMode = process.argv.includes('--watchdog');
 if (smoke && !process.env.AR_DATA_DIR) process.env.AR_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(),'ai-reminder-smoke-'));
-const directory = process.env.AR_DATA_DIR || path.join(app.getPath('appData'),'AI到期提醒');
+const directory = process.env.AR_DATA_DIR || path.join(app.getPath('appData'),process.platform === 'win32' ? 'AI到期提醒' : 'AI到期提醒-Windows预览');
 app.setPath('userData',path.join(directory,watchdogMode ? 'desktop-watchdog' : 'desktop'));
 if (smoke) app.setName('AI到期提醒 Windows 验收');
 else app.setName('AI到期提醒');
