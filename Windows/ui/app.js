@@ -5,6 +5,7 @@ let snapshot = null, editing = null, timingItem = null, collapseTimer, previewTi
 window.uiReady = new Promise(resolve => { readyResolve = resolve; });
 const localDate = seconds => { const date = new Date(seconds*1000); return new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16); };
 const timestamp = input => new Date(input).getTime()/1000;
+const editorTimestamp = id => editing && $(id).value === localDate(editing.expires_at) ? editing.expires_at : timestamp($(id).value);
 const absolute = seconds => new Date(seconds*1000).toLocaleString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
 function remaining(expiry, short = false) {
   const difference = expiry-Date.now()/1000, past = difference <= 0, hours = Math.floor(Math.abs(difference)/3600), minutes = Math.floor(Math.abs(difference)%3600/60);
@@ -96,7 +97,7 @@ async function previewPlan() {
   clearTimeout(previewTimer);
   if ($('kind').value !== 'weekly') return;
   previewTimer = setTimeout(async () => {
-    try { const plan = await call('plan',{expiry:timestamp($('expiry').value),first:timestamp($('first').value)}); $('plan').textContent = `${plan.dates.length} 轮，每 7 天重置：\n${plan.dates.map(absolute).join('\n')}\n${plan.advice}${plan.dropped ? `\n跳过已过去的 ${plan.dropped} 轮。` : ''}`; }
+    try { const plan = await call('plan',{expiry:editorTimestamp('expiry'),first:editorTimestamp('first')}); $('plan').textContent = `${plan.dates.length} 轮，每 7 天重置：\n${plan.dates.map(absolute).join('\n')}\n${plan.advice}${plan.dropped ? `\n跳过已过去的 ${plan.dropped} 轮。` : ''}`; }
     catch (e) { $('plan').textContent = e.message; }
   },150);
 }
@@ -115,8 +116,8 @@ $('edit-form').onsubmit = async event => {
   event.preventDefault(); $('save').disabled = true; $('edit-error').textContent = '';
   try {
     const kind = $('kind').value;
-    const item = {...(editing || {}),name:$('name').value,vendor:$('vendor').value,kind:kind === 'weekly' ? 'subscription' : kind,expires_at:timestamp($('expiry').value),repeat_hours:kind === 'window' ? +$('period').value : null,reset_rule:kind === 'window' ? $('rule').value : null,reset_param:kind === 'window' && $('rule').value !== 'rolling' ? +$('param').value : null,note:$('note').value};
-    await call('save',{item,weekly:kind === 'weekly',first:timestamp($('first').value)});
+    const item = {...(editing || {}),name:$('name').value,vendor:$('vendor').value,kind:kind === 'weekly' ? 'subscription' : kind,expires_at:editorTimestamp('expiry'),repeat_hours:kind === 'window' ? +$('period').value : null,reset_rule:kind === 'window' ? $('rule').value : null,reset_param:kind === 'window' && $('rule').value !== 'rolling' ? +$('param').value : null,note:$('note').value};
+    await call('save',{item,weekly:kind === 'weekly',first:editorTimestamp('first')});
     $('editor').close(); notify('已保存。');
   } catch (e) { $('edit-error').textContent = e.message; }
   finally { $('save').disabled = false; }
@@ -173,6 +174,10 @@ window.runSmoke = async () => {
   expect($('records').querySelectorAll('tr').length === 1,'saved item appears in table');
   $('records').querySelector('button').click(); $('name').value = '取消的改动'; $('cancel-edit').click();
   expect(snapshot.items[0].name === '验收订阅','edit cancel preserves name');
+  const precise = snapshot.items[0].expires_at+7.125;
+  await call('save',{item:{...snapshot.items[0],expires_at:precise}}); await settle(() => snapshot.items[0].expires_at === precise);
+  $('records').querySelector('button').click(); $('note').value = '只修改备注'; $('save').click(); await settle(() => !$('editor').open);
+  expect(snapshot.items[0].expires_at === precise,'editing note preserves exact expiry timestamp');
   $('records').querySelector('.timing-button').click(); $('days').value = '2'; $('hours').value = '3'; $('save-timing').click();
   await settle(() => !$('timing').open && snapshot.reminderHours[snapshot.items[0].id] === 51);
   expect(true,'day/hour reminder saves through renderer');
