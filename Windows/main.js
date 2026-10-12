@@ -10,7 +10,7 @@ const smoke = process.argv.includes('--smoke-test');
 const watchdogMode = process.argv.includes('--watchdog');
 if (smoke && !process.env.AR_DATA_DIR) process.env.AR_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(),'ai-reminder-smoke-'));
 const directory = process.env.AR_DATA_DIR || path.join(app.getPath('appData'),'AI到期提醒');
-app.setPath('userData',path.join(directory,'desktop'));
+app.setPath('userData',path.join(directory,watchdogMode ? 'desktop-watchdog' : 'desktop'));
 if (smoke) app.setName('AI到期提醒 Windows 验收');
 else app.setName('AI到期提醒');
 let store, panel, manager, tray, watchdog, quitting = false, refreshing = false;
@@ -170,6 +170,11 @@ async function runSmoke() {
   await manager.webContents.executeJavaScript('window.uiReady');
   const result = await manager.webContents.executeJavaScript('window.runSmoke()');
   evidence.checks.push(...result);
+  const sourceResult = await new Promise((resolve,reject) => {
+    const worker = new Worker(path.join(__dirname,'readers.js'),{workerData:{home:path.join(directory,'reader-fixtures'),now:seconds(),codexHome:path.join(directory,'reader-fixtures','.codex')}});
+    worker.once('message',resolve); worker.once('error',reject);
+  });
+  check(sourceResult.items.length === 0 && sourceResult.statuses.length === 4,'packaged background reader runs without inventing records');
   check(store.items().length === 1,'renderer add persists in SQLite');
   const saved = store.items()[0];
   check(store.hours(saved.id) === 51,'renderer timing persists');
@@ -215,11 +220,14 @@ else {
   app.on('second-instance',() => { if (panel) expand(true); });
   app.whenReady().then(async () => {
     try {
+      // Windows 默认菜单栏占用 21px，会把 18px 胶囊撑到 39px。
+      // 操作入口已由胶囊、管理页和托盘提供，保持浮窗没有菜单栏。
+      Menu.setApplicationMenu(null);
       store = new Store(directory); store.lifecycle(); manual = store.items(); reminderHours = store.reminderSettings();
       panel = makeWindow({width:54,height:18,minWidth:54,minHeight:18,frame:false,thickFrame:false,transparent:true,backgroundColor:'#00000000',resizable:false,minimizable:false,maximizable:false,fullscreenable:false,skipTaskbar:true,alwaysOnTop:true,show:false},'float');
       panel.setAlwaysOnTop(true,'screen-saver');
       panel.setVisibleOnAllWorkspaces(true,{visibleOnFullScreen:true});
-      if (process.platform === 'win32') panel.setBackgroundMaterial('acrylic');
+      if (process.platform === 'win32' && Number(os.release().split('.')[2]) >= 22621) panel.setBackgroundMaterial('acrylic');
       panel.setBounds(geometry(store.state.panelCollapsed !== false,false));
       if (Array.isArray(store.state.position) && store.state.position.length === 2 && store.state.position.every(Number.isFinite)) {
         const area = screen.getDisplayNearestPoint({x:store.state.position[0],y:store.state.position[1]}).workArea;
@@ -227,6 +235,7 @@ else {
       }
       panel.on('close',event => { if (!quitting) { event.preventDefault(); panel.hide(); } });
       panel.once('ready-to-show',() => { panel.show(); broadcast(); });
+      if (process.argv.includes('--resident-acceptance-child') && process.env.AR_ACCEPTANCE_PID_FILE) fs.writeFileSync(process.env.AR_ACCEPTANCE_PID_FILE,String(process.pid));
       const icon = nativeImage.createFromPath(path.join(__dirname,'icon.png')).resize({width:20,height:20});
       tray = new Tray(icon);
       tray.setContextMenu(Menu.buildFromTemplate([{label:'展开悬浮窗',click:() => expand(true)},{label:'管理记录',click:() => openManager()},{label:'立即刷新本地数据',click:refreshOfficial},{label:'悬浮窗归位',click:() => action('home')},{label:'打开数据文件夹',click:() => shell.openPath(directory)},{type:'separator'},{label:'彻底退出',click:() => { quitting = true; stopWatchdog(); app.quit(); }}]));

@@ -68,6 +68,8 @@ jobs:
           if (-not $uninstaller) { throw 'Uninstaller missing' }
           Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -Wait
           if (-not (Test-Path -LiteralPath (Join-Path $data 'uninstall-preservation-marker.txt'))) { throw 'Uninstall removed application data' }
+      - name: Native crash recovery acceptance
+        run: node test/watchdog-smoke.cjs 'dist/${{ matrix.unpacked }}/AI到期提醒.exe'
       - name: Checksums
         run: |
           Get-ChildItem dist/*.exe, dist/*.zip | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } | Set-Content -Encoding utf8NoBOM "dist/SHA256SUMS-Windows-${{ matrix.arch }}.txt"
