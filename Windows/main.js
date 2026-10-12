@@ -178,8 +178,13 @@ async function runSmoke() {
   const exportData = store.exportData();
   store.delete(saved.id); check(store.items().length === 0,'delete removes only selected record');
   store.importData(exportData); reload(); check(store.items().length === 1,'backup import restores deleted item');
-  check(panel.getBounds().width === 54 && panel.getBounds().height === 18,'native collapsed window is 54×18');
-  expand(true); check(panel.getBounds().width === 240,'native expanded window width is 240');
+  for (let i = 0; i < 40 && (panel.getBounds().width !== 54 || panel.getBounds().height !== 18); i++) await new Promise(resolve => setTimeout(resolve,50));
+  evidence.collapsedBounds = panel.getBounds();
+  check(evidence.collapsedBounds.width === 54 && evidence.collapsedBounds.height === 18,'native collapsed window is 54×18: ' + JSON.stringify(evidence.collapsedBounds));
+  expand(true);
+  for (let i = 0; i < 40 && panel.getBounds().width !== 240; i++) await new Promise(resolve => setTimeout(resolve,50));
+  evidence.expandedBounds = panel.getBounds();
+  check(evidence.expandedBounds.width === 240,'native expanded window width is 240: ' + JSON.stringify(evidence.expandedBounds));
   openManager();
   await new Promise((resolve,reject) => { if (manager.webContents.isLoading()) { manager.webContents.once('did-finish-load',resolve); manager.webContents.once('did-fail-load',reject); } else resolve(); });
   await manager.webContents.executeJavaScript('window.uiReady');

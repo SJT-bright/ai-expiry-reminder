@@ -18,4 +18,5 @@ Windows/.cache/
 *.sqlite-shm
 state.json
 native-smoke-receipt.json
+Windows/*smoke-results/
 .release-local/

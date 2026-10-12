@@ -16,7 +16,12 @@ const timeout = setTimeout(() => { child.kill(); fs.writeFileSync(path.join(outp
 child.on('error',error => { clearTimeout(timeout); fs.writeFileSync(path.join(output,'native-smoke.log'),String(error)); process.exit(1); });
 child.on('exit',code => {
   clearTimeout(timeout); fs.writeFileSync(path.join(output,'native-smoke.log'),log);
-  if (code !== 0 || !fs.existsSync(receipt)) { console.error(log); process.exit(1); }
+  if (code !== 0 || !fs.existsSync(receipt)) {
+    const reason = fs.existsSync(receipt) ? fs.readFileSync(receipt,'utf8') : log || 'Native process exited without a receipt';
+    console.error(reason);
+    console.error('::error title=Native desktop acceptance::' + reason.replace(/%/g,'%25').replace(/\r/g,'%0D').replace(/\n/g,'%0A'));
+    process.exit(1);
+  }
   const result = JSON.parse(fs.readFileSync(receipt));
   if (result.error || !result.checks?.length) { console.error(result); process.exit(1); }
   console.log(`Native ${result.platform}/${result.arch}: ${result.checks.length} checks passed, Electron ${result.electron}`);
