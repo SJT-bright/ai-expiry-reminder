@@ -216,7 +216,7 @@ else {
   app.whenReady().then(async () => {
     try {
       store = new Store(directory); store.lifecycle(); manual = store.items(); reminderHours = store.reminderSettings();
-      panel = makeWindow({width:54,height:18,minWidth:54,minHeight:18,frame:false,transparent:true,backgroundColor:'#00000000',resizable:false,skipTaskbar:true,alwaysOnTop:true,show:false},'float');
+      panel = makeWindow({width:54,height:18,minWidth:54,minHeight:18,frame:false,thickFrame:false,transparent:true,backgroundColor:'#00000000',resizable:false,minimizable:false,maximizable:false,fullscreenable:false,skipTaskbar:true,alwaysOnTop:true,show:false},'float');
       panel.setAlwaysOnTop(true,'screen-saver');
       panel.setVisibleOnAllWorkspaces(true,{visibleOnFullScreen:true});
       if (process.platform === 'win32') panel.setBackgroundMaterial('acrylic');
